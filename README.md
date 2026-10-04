@@ -1,0 +1,469 @@
+# Quantum-Enhanced Dynamic Last-Mile Route Optimisation
+
+## Selected Problem Statement
+
+### VNQFF-08 — Quantum-Enhanced Last-Mile Route Optimisation
+
+**Organizer problem context:** “Dynamic vehicle routing with multiple destinations, traffic conditions, capacity limits, and time windows creates difficult combinatorial optimization problems.”
+
+**Our project scope:** a small, constrained last-mile routing instance with
+multiple vehicles and destinations, vehicle-capacity limits, delivery time
+windows, traffic conditions, route distance/time/cost, configured fuel and CO2
+metrics, and dynamic re-optimization after traffic or fleet changes. The
+application demonstrates these constraints; it does not claim to solve every
+real-world routing requirement. The Proposed Solution section describes our
+approach to this organizer problem.
+
+## Dataset and Scenario Information
+
+This project does not claim to use a large external machine-learning dataset.
+Demo Mode uses deterministic synthetic/hardcoded routing scenarios. Benchmark
+Mode generates deterministic scenario cases in code. Inputs include vehicle
+capacities, delivery demands and destinations, time windows, traffic
+conditions, fuel configuration, and route costs. These cases make optimizer
+behavior reproducible for the configured scenario and seed; they are not a
+representative sample of real delivery operations.
+
+The scenario and data-generation code is in
+[`route_dashboard/demo_mode.py`](route_dashboard/demo_mode.py),
+[`route_dashboard/benchmark_suite.py`](route_dashboard/benchmark_suite.py),
+[`route_dashboard/scenario.py`](route_dashboard/scenario.py), and
+[`route_dashboard/routing.py`](route_dashboard/routing.py). The built-in Demo
+Mode uses local coordinate estimates and does not request OSRM. In other
+dashboard scenarios, optional OSRM requests can provide road distances, base
+durations, and route geometry; those are routing inputs, not a delivery dataset
+or live traffic feed. Traffic changes in Demo Mode are simulated.
+
+## Proposed Solution
+
+The hybrid workflow is:
+
+Real-world routing constraints → classical feasibility filtering → feasible
+route-option generation → QUBO formulation → Qiskit Optimization / Ising
+conversion → QAOA → local Qiskit Aer simulation → route decoding → feasibility
+validation → explicitly confirmed IBM Quantum hardware execution for the
+supported Demo Mode case → dynamic traffic/fleet re-optimization.
+
+The classical layer enumerates feasible routes and supplies route options to
+the QUBO. QAOA samples selections from that formulation; the application then
+decodes and validates results using the existing feasibility checks. This
+keeps operational constraints and the exact classical baseline visible while
+allowing a small quantum workflow to be evaluated. Hardware execution is a
+separate, explicitly confirmed path for the supported demo problem. This
+architecture does not establish quantum advantage.
+
+## Classical Optimization Core
+
+The current core accepts vehicles, deliveries, and caller-provided directed
+distance and duration matrices. It checks vehicle capacity, delivery service
+time windows, and vehicle shift end times; evaluates route costs; generates
+feasible ordered routes; and selects a minimum-cost set of routes that covers
+each delivery exactly once while using each vehicle at most once.
+
+The exact baseline enumerates route permutations and is intended for small
+hackathon instances. Delivery time windows constrain the start of service.
+Route distance and elapsed time include the return leg to each vehicle's
+configured end location. Elapsed time includes driving, waiting, and service.
+
+## Qiskit Implementation Details: QAOA Route Selection
+
+The QAOA layer reuses the feasible route options and costs from the classical
+core. Each feasible vehicle-route option is one binary QUBO variable. The
+objective sums route costs, adds a squared penalty for each delivery not being
+covered exactly once, and adds pairwise penalties when multiple routes use the
+same vehicle. Qiskit Optimization stores the QUBO and maps it to an Ising
+operator; QAOA samples it using Qiskit Aer. Every selected route is decoded and
+rechecked through the classical feasibility evaluator. A run with no valid sampled
+route set is reported as a failure, not replaced with a fabricated result.
+
+The local implementation uses Qiskit, Qiskit Optimization, Qiskit Aer for
+simulation, and Qiskit Algorithms for QAOA. Install the pinned versions with
+`python -m pip install -r requirements.txt`:
+
+- `qiskit==2.5.2`
+- `qiskit-optimization==0.7.0`
+- `qiskit-aer==0.17.2`
+- `qiskit-algorithms==0.4.0`
+- `qiskit-ibm-runtime==0.50.0`
+- `python-dotenv==1.2.1`
+- `streamlit==1.58.0`
+- `folium==0.20.0`
+- `streamlit-folium==0.27.4`
+- `pandas==3.0.4`
+
+Run the full test suite from the repository root:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Run a reproducible small exact-versus-QAOA comparison with:
+
+```powershell
+python -m examples.day2_comparison
+```
+
+The exact classical solver is the optimum for the same candidate route set;
+QAOA uses stochastic sampling and is not expected to beat it on such a small
+instance. For the hardware demonstration, optimized QAOA parameters are
+extracted from the local Aer optimizer result and passed through a separate,
+validated circuit adapter. Local Aer sampling and real IBM hardware sampling
+are distinct executions. Hardware counts are decoded through the saved route
+variable mapping and the resulting route is rechecked for feasibility.
+
+## Results and Observations
+
+The deterministic Demo Mode baseline produced the following physical metrics.
+The local values are reproducible from the checked-in scenario and optimizer;
+the IBM figures below describe the completed hardware result associated with
+this project. Automated IBM tests use mocks and do not independently reproduce
+a hardware execution.
+
+| Method | Distance | Travel time | Cost | Fuel | CO2 |
+|---|---:|---:|---:|---:|---:|
+| Classical Optimization | 18.225 km | 34.171 min | $21.814 | 1.640 L | 4.396 kg |
+| Local Aer QAOA | 18.225 km | 34.171 min | $21.814 | 1.640 L | 4.396 kg |
+| REAL IBM QUANTUM HARDWARE (`ibm_fez`, 256 shots, DONE) | approximately 18.22 km | approximately 34 min | approximately $21.81 | 1.640 L | 4.396 kg |
+
+The completed IBM hardware result passed the existing feasibility validation.
+The hardware measures bitstrings; the displayed distance, time, cost, fuel,
+and CO2 are calculated for the decoded route using the configured scenario
+model. The measured bitstring distribution is retained separately in the IBM
+Quantum Hardware workspace. Matching results on this small demonstration case
+do **not** demonstrate quantum advantage or quantum speedup. The hardware run
+demonstrates an actual Qiskit workflow executed on IBM Quantum hardware; it is
+not evidence that hardware was faster or that the result is globally optimal.
+
+The deterministic Normal-to-Heavy traffic comparison retained the same route
+distance while increasing travel time and cost. Fuel and CO2 remained
+unchanged because the configured fuel/emissions model depends on distance:
+
+| Traffic | Distance | Travel time | Cost | Fuel | CO2 |
+|---|---:|---:|---:|---:|---:|
+| Normal | approximately 18.225 km | approximately 34.171 min | approximately $21.814 | 1.640 L | 4.396 kg |
+| Heavy | approximately 18.225 km | approximately 52.965 min | approximately $29.382 | 1.640 L | 4.396 kg |
+
+In the standalone objective comparison, Green Priority produced approximately
+17.803 km, 33.382 min, $29.324 cost, 1.602 L fuel, and 4.294 kg CO2. This is a
+different trade-off from the cost-focused baseline. Objective scores are
+normalized for their respective profiles and are not directly rankable across
+profiles; there is no universally best route.
+
+## Run the tests
+
+From the repository root, run:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The classical core uses the Python standard library. The Qiskit optimizer
+requires the packages listed above.
+
+## Day 3: Dispatch dashboard
+
+Start the application from the repository root with:
+
+```powershell
+python -m streamlit run app.py
+```
+
+The dashboard starts with a small San Francisco scenario. Depot coordinates,
+vehicle count and capacity, shift times, delivery destinations and coordinates,
+demand, time windows, traffic, fuel or energy price, and driver hourly cost can
+be edited before each run. Results come from the existing classical and QAOA
+optimizers and are revalidated before they are displayed. QAOA runs locally on
+Aer with an editable random seed and sampler configuration.
+
+Local travel matrices use a coordinate distance estimate with a road adjustment
+and traffic-scaled travel time. The optional OSRM table request only supplies
+distance and duration; any request or matrix failure falls back to local
+estimates. The map plots the entered coordinates and optimizer route order; its
+OpenStreetMap basemap needs an internet connection. Local Aer QAOA is limited to
+22 route-selection variables by the dashboard to avoid impractical simulation
+sizes; larger cases still show the classical result and report that QAOA was
+not run.
+
+## Day 4: Benchmark mode
+
+Open **Benchmark Mode** in the dashboard and select one built-in scenario
+or **All scenarios**. The fixed-seed suite includes 2-, 3-, 4-, and 5-delivery
+cases with multiple vehicle counts, traffic conditions, demands, and time
+windows. It records solver-plus-validation runtimes, objectives, gaps, route
+validity, and QAOA sample metadata. QAOA is run only at or below the 22-variable
+local Aer limit; skipped and failed runs are shown explicitly, with no substitute
+solution. Runtime measurements describe this local experiment and are not a
+general solver-performance claim.
+
+## Day 5: Dynamic routing
+
+After running a scenario, use **Dynamic Traffic** to apply a simulated
+traffic incident and re-optimize. The supported profiles are Calm, Normal,
+Moderate, Heavy, and Storm. They scale travel durations deterministically; they
+are scenario inputs, not live traffic, GPS, or incident feeds. The incident
+keeps the depot, vehicles, capacity, deliveries, demands, time windows, shift,
+fuel type, and fuel price unchanged. It rebuilds travel-time/cost inputs, runs
+the exact classical optimizer and QAOA when within the existing 22-variable
+Aer limit, and revalidates route sets before rendering them.
+
+When the OSRM option is enabled, the public OSRM table service supplies road
+distance and base duration; those table and route-geometry responses are cached
+in memory by coordinates. OSRM failures use the local coordinate estimate and
+are labeled in the dashboard. Without OSRM, the app makes no routing API calls.
+The Folium map uses OSRM road geometry only when it is returned successfully;
+otherwise it labels and draws straight-line/local route polylines.
+
+Before/after fuel use is estimated from route distance and the configured
+per-kilometer consumption factors. CO2 is an estimated tailpipe value using
+2.68 kg/L for diesel and 2.31 kg/L for gasoline; electric vehicles show zero
+tailpipe CO2, not zero lifecycle or grid emissions. Displayed changes are
+After - Before, not claimed savings. Fleet rows come from revalidated vehicle
+routes and are checked for unique delivery assignment and capacity.
+
+## Day 6: Country and currency display
+
+Use **Location & currency** in the sidebar to choose **Auto Detect** or
+**Manual country selection**. Auto Detect reads the browser's `Accept-Language`
+region only; it does not request GPS, IP geolocation, or other sensitive
+information. If no supported region is present, India/INR is the default.
+Manual selection always takes precedence.
+
+Country choices include India (INR), USA (USD), UK (GBP), euro-area countries
+(EUR), Japan (JPY), Australia (AUD), Canada (CAD), Singapore (SGD), UAE (AED),
+and a broader set across Europe, Asia, Africa, and the Americas. Amounts shown
+in another currency are converted from the application's USD base amounts
+using the public [ExchangeRate-API open access rates](https://www.exchangerate-api.com/).
+The feed updates daily, is cached for 24 hours in the running Streamlit app,
+and its reported update time is shown in the UI. Provider attribution is
+included in the currency panel.
+
+Currency conversion is strictly presentational. The optimizer, QUBO, QAOA,
+benchmark inputs, and objective values remain unchanged and currency-neutral;
+the app's configured fuel and driver cost inputs are explicitly denominated in
+USD base units. Fuel-price equivalents shown in the selected currency are
+reference conversions, not local market-price quotes. Benchmark objectives
+are converted only for tables and chart display; recorded benchmark values and
+relative gaps remain as computed.
+
+If the exchange-rate service is unreachable or does not provide the selected
+currency, the app continues using USD and explicitly labels amounts as USD
+instead of attaching an unsupported local symbol. Auto-detected country uses
+browser locale rather than physical location, and the daily rate is not a live
+transaction quote.
+
+## Day 7: Fleet disruption recovery
+
+Open **Fleet Disruption** to mark a vehicle **Unavailable / Breakdown**, restore
+it when ready, set delivery priorities, and optionally select a new traffic
+condition before re-optimization. If no scenario has been run yet, the workspace
+loads a deterministic four-vehicle, eight-delivery example with heterogeneous
+vehicle capacities, distinct delivery windows, and Critical, High, Normal, and
+Low priority tiers. If a route scenario is already active, that scenario and
+its current traffic data are used instead.
+
+The disruption service keeps availability and priority metadata outside the
+optimization models. It enumerates the existing feasible route candidates and
+uses a priority-aware set-packing pass to choose the largest feasible delivery
+mix in lexicographic order: Critical first, then High, Normal, and Low. Among
+equally prioritized mixes it uses existing route costs as the tie-break. It
+then sends the selected delivery subset through the existing classical
+optimizer, revalidates routes, and runs the existing QAOA path when the
+candidate route count is within the 22-variable local Aer limit. Larger
+instances retain the classical result and show the QAOA skip reason; no
+quantum result is substituted or fabricated.
+
+Deliveries that cannot be served remain visible in the unassigned/waitlist
+table with their priority and a capacity, time-window, shift, or combined
+feasibility reason. No delivery is silently dropped. The before/after panels
+show available vehicles, served and unassigned counts, distance, travel time,
+cost, fuel, and estimated tailpipe CO2; a separate table identifies deliveries
+moved from the unavailable vehicle. Selecting Heavy or another supported
+traffic profile uses the existing traffic-matrix recalculation before fleet
+re-optimization. This is a simulated breakdown and traffic scenario, not a
+live fleet or GPS feed.
+
+Displayed costs continue to use the global currency selector. Optimization
+costs and benchmark calculations remain in their configured USD base units;
+currency conversion is presentation-only.
+
+## Day 8: Multi-objective route optimization
+
+Choose **Cost Priority**, **Time Priority**, **Green Priority**, or **Balanced**
+in Route Optimization. The selected profile is retained when changing traffic
+or re-optimizing after a vehicle breakdown.
+
+Profiles use normalized weights in cost/time/green order:
+
+- Cost Priority: `(1, 0, 0)`
+- Time Priority: `(0, 1, 0)`
+- Green Priority: `(0, 0, 1)`
+- Balanced: `(1/3, 1/3, 1/3)`
+
+Cost Priority is exactly the existing monetary objective. Time Priority
+minimizes route elapsed time, including driving, service, and waiting. Green
+Priority minimizes normalized fuel and tailpipe CO2 together. With the current
+fixed per-distance fuel and emissions factors, both green measures are
+distance-derived. Balanced combines the three normalized components equally.
+
+Normalization uses deterministic scenario-wide upper bounds rather than
+candidate-route extrema. Distance is scaled by the largest travel-matrix arc
+times a conservative maximum route-leg count. Elapsed time is scaled by the
+sum of vehicle shift durations. Cost, fuel, and CO2 scales derive from those
+bounds and configured physical inputs. Each component is divided by its
+positive scale before the profile weights are applied, so dollars, minutes,
+liters, and kilograms are not added as raw values.
+
+The objective layer translates the normalized terms into additive route
+weights for the existing classical optimizer and QUBO route-cost terms. Route
+generation, feasibility checks, decoding, and validation continue to use the
+existing implementations. Results show the dimensionless selected objective
+separately from actual operating cost, distance, travel time, fuel, and
+estimated tailpipe CO2. Trade-off rows report measured values and do not label
+one profile or solver as universally best. QAOA uses the same scored candidate
+routes as the classical solver; it remains stochastic and no quantum advantage
+is implied.
+
+Benchmark Mode remains fixed to Cost Priority so its deterministic cases stay
+comparable across runs. Benchmark calculations are unchanged; only monetary
+display follows the global currency selection. Normalization is a deterministic
+reference-scale model, not a claim that every business preference or lifecycle
+environmental impact is represented.
+
+## Demo Mode
+
+Open **Demo Mode** and choose **Run Full Demo** to run the deterministic local
+scenario. Choose **Reset Demo** to clear the demo result. The current UI
+presentation sequence is:
+
+1. **Stage 1 — Baseline:** scenario, vehicles, deliveries, traffic, selected
+	 objective, classical route, local Aer route when valid, and feasibility.
+2. **Stage 2 — Quantum Optimization:** classical feasibility, route QUBO,
+	 QAOA, local Aer simulation, route decoding, and feasibility validation.
+3. **Stage 3 — Dynamic Traffic:** simulated Normal-to-Heavy traffic with
+	 before/after route, distance, travel time, and cost. This is not live traffic.
+4. **Stage 4 — Fleet Disruption:** simulate van-2 becoming unavailable, show
+	 reassigned and waitlisted deliveries, and report the updated route and
+	 metrics.
+5. **Stage 5 — Sustainability / Objective Trade-offs:** compare Cost, Time,
+	 Green, and Balanced profiles with physical distance, time, cost, fuel, and
+	 tailpipe CO2 metrics.
+6. **Stage 6 — Real IBM Quantum Hardware Comparison:** compare Classical
+	 Optimization, Local Aer QAOA, and REAL IBM QUANTUM HARDWARE when a completed
+	 hardware result is available and compatible with the current Demo Mode
+	 scenario and QUBO. Incompatible results are not mixed with demo metrics;
+	 measured bitstrings remain available in the IBM workspace.
+7. **Final Summary:** show the routing-to-hardware pipeline and a compact
+	 sustainability/fleet metrics summary.
+
+All demo results use the existing optimization services and session results;
+the UI does not fabricate missing results. Matching classical, Aer, and
+hardware metrics on this small case do not demonstrate quantum advantage.
+QAOA remains stochastic, and its failure or skip status is shown without
+substitution. Fuel and CO2 use the configured per-distance estimates and
+tailpipe-only scope.
+
+## IBM Quantum Hardware Integration
+
+The **IBM Quantum Hardware** workspace supports user-initiated backend
+discovery, backend selection, dry-run validation, explicit confirmation,
+submission to real IBM Quantum hardware, manual job-status refresh, and
+completed-result decoding. Credentials are read from `IBM_QUANTUM_API_KEY` in
+the process environment or the local Git-ignored `.env` file; credentials are
+not displayed. Normal page load and normal Demo Mode rendering do not connect,
+discover backends, submit, or refresh jobs.
+
+Select **Discover IBM Backends** to request backend metadata. Select a returned
+backend to review its type, qubit count, availability, queue information, and
+supported operations when available. Discovery and backend selection are
+read-only. Select **Run Hardware Dry-Run** to explicitly connect, obtain
+validated QAOA parameters from the local Aer path, check the supported four
+route-variable Demo Mode QUBO, validate backend status and qubit fit, and
+transpile locally. The dry-run does not submit a job. The first-demo circuit is
+limited to five required qubits; shots are configurable from 1 to 1,024, with
+256 as the default.
+
+After reviewing the dry-run details, a hardware job can be submitted only
+after the user checks the explicit REAL-hardware confirmation and selects
+**Submit ONE REAL IBM Quantum Job**. The submission path uses IBM Quantum
+Runtime and does not retry automatically. The job ID and state are kept in the
+current Streamlit session. **Refresh Job Status** manually queries that saved
+job; it does not submit another job. Results are fetched from the existing job
+after it reaches `DONE`.
+
+`ibm_qaoa_parameters.py` extracts genuine optimized parameters from the local
+Aer optimizer result for the Demo Mode QUBO. `ibm_qaoa_adapter.py` binds those
+parameters into the measured QAOA circuit and preserves the mapping from
+bitstrings to route variables. After explicit submission through IBM Quantum
+Runtime, the workspace retains the raw measurement distribution and most
+frequent bitstring. A decoded route is rechecked using the existing feasibility
+validation. Invalid results retain their measurements and are never replaced
+with an artificial route. Compatible completed results can be compared in Demo
+Mode; the comparison uses the saved result and does not make an IBM request.
+
+## Limitations
+
+- Local Aer QAOA is limited to approximately 22 route-selection variables in
+	the dashboard; larger cases retain the classical result and report QAOA as
+	skipped.
+- QAOA sampling is stochastic and may return no valid route sample. The app
+	reports that outcome without substituting a result.
+- Demo and benchmark scenarios are small, deterministic cases, not a large
+	external ML dataset or a representative real-world delivery sample.
+- Demo traffic and fleet changes are simulated; live traffic and GPS feeds are
+	not used.
+- Fuel use is calculated from configured per-distance consumption and CO2 is
+	estimated tailpipe emissions. Lifecycle and grid emissions are not modeled.
+- Real hardware comparison is demonstrated on the supported small Demo Mode
+	case. Matching results do not demonstrate quantum advantage or speedup, and
+	no solver is claimed to be globally optimal from the hardware measurement.
+- Optional OSRM requests provide road-routing information, not live traffic.
+	Coordinate estimates are used when OSRM is not requested or is unavailable.
+
+## Team Details
+
+- Team Name: K-NOVA
+- Team Leader: Challa Ashok
+- Team Members:
+	- Pokuri Jahna Sai Kaveri
+	- Palla Panini Venkata Sai Varun
+	- Mukkala Asritha
+	- Veruva Vamsi Krishna
+
+## Presentation / Demo File
+
+The interactive Demo Mode is available in the application.
+
+Presentation/Demo: To be attached before final submission.
+
+No presentation deck, PDF, or video file is currently present in this repository.
+
+## Project Documentation
+
+This README is the project’s technical documentation and covers the problem,
+scenario generation, architecture, measured observations, setup, operation,
+and limitations. Implementation details are in the linked `route_dashboard/`,
+`quantum_route_optimisation/`, and IBM integration modules. Run the test suite
+from the repository root with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+## References & Acknowledgements
+
+- Qiskit: [IBM Qiskit](https://www.ibm.com/quantum/qiskit) and the
+	[Qiskit repository](https://github.com/Qiskit/qiskit).
+- Qiskit Optimization: [project documentation](https://qiskit-community.github.io/qiskit-optimization/).
+- Qiskit Aer: [project documentation](https://qiskit.github.io/qiskit-aer/).
+- IBM Quantum and IBM Quantum Runtime: [IBM Quantum platform](https://quantum.ibm.com/)
+	and the [Qiskit Runtime repository](https://github.com/Qiskit/qiskit-ibm-runtime).
+- OpenStreetMap, for map tiles when displayed: [copyright and attribution](https://www.openstreetmap.org/copyright).
+- OSRM, for optional road-routing tables and route geometry:
+	[project site](https://project-osrm.org/).
+- ExchangeRate-API, for optional presentational currency conversion:
+	[open access rates](https://www.exchangerate-api.com/).
+
+The built-in routing scenarios are generated by this project; no external
+delivery dataset is claimed. **Official VNQFF-08 organizer source:** to be
+added when available. No official problem-statement URL was present in this
+repository, so none is invented here.
