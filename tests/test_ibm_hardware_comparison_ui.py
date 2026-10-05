@@ -132,7 +132,7 @@ class IBMHardwareComparisonUITests(unittest.TestCase):
 
         self.assertIn(f"{impact.distance_km:.2f} km", displayed_metrics)
         self.assertIn(ui._format_duration(impact.travel_time_min), displayed_metrics)
-        display_money = app.session_state["currency_display"].format_money(impact.cost)
+        display_money = ui._format_money(impact.cost)
         self.assertIn(display_money, displayed_metrics)
         self.assertIn(f"{impact.fuel_used:.3f} {impact.fuel_unit}", displayed_metrics)
         self.assertIn(f"{impact.tailpipe_co2_kg:.3f} kg", displayed_metrics)

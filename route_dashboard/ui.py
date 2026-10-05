@@ -23,17 +23,10 @@ from .demo_mode import (
 from .map_view import build_route_map
 from .benchmark_suite import BenchmarkResult, generate_benchmark_scenarios, run_benchmark
 from .currency import (
-    AUTO_DETECT,
-    BASE_CURRENCY,
-    COUNTRY_CURRENCIES,
-    COUNTRY_OPTIONS,
-    DEFAULT_COUNTRY,
-    MANUAL_SELECTION,
-    CurrencyDisplay,
-    ExchangeRates,
-    build_currency_display,
-    fetch_usd_exchange_rates,
-    resolve_country,
+    INR_PER_COST_UNIT,
+    cost_units_to_inr,
+    format_cost,
+    inr_to_cost_units,
 )
 from .fleet_disruption import (
     DEFAULT_PRIORITY,
@@ -100,11 +93,6 @@ DEFAULT_ROWS = [
 ]
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def _cached_usd_exchange_rates() -> ExchangeRates:
-    return fetch_usd_exchange_rates()
-
-
 def main() -> None:
     st.set_page_config(
         page_title="QuantumRoute | Smarter Routes",
@@ -118,8 +106,6 @@ def main() -> None:
     if current is None and disruption is not None and disruption.after_run is not None:
         current = {"scenario": disruption.optimization_scenario, "run": disruption.after_run}
     _render_page_header(page, current)
-    _render_currency_status()
-
     if page == "Dashboard":
         _render_dashboard(current)
     elif page == "Route Optimization":
@@ -191,52 +177,6 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
             label_visibility="collapsed",
         )
         st.divider()
-        with st.expander("Location & currency", expanded=False):
-            location_mode = st.selectbox(
-                "Location mode",
-                (AUTO_DETECT, MANUAL_SELECTION),
-                key="currency_location_mode",
-            )
-            accept_language = st.context.headers.get("Accept-Language", "")
-            manual_country = None
-            if location_mode == MANUAL_SELECTION:
-                manual_country = st.selectbox(
-                    "Country",
-                    COUNTRY_OPTIONS,
-                    index=COUNTRY_OPTIONS.index(DEFAULT_COUNTRY),
-                    key="manual_currency_country",
-                )
-
-            resolution = resolve_country(location_mode, accept_language, manual_country)
-            target_currency = COUNTRY_CURRENCIES[resolution.country]
-            exchange_rates = None
-            rate_error = None
-            if target_currency != BASE_CURRENCY:
-                try:
-                    exchange_rates = _cached_usd_exchange_rates()
-                except Exception as error:
-                    rate_error = f"Exchange-rate lookup failed: {type(error).__name__}."
-            currency_display = build_currency_display(
-                resolution.country,
-                exchange_rates,
-                fallback_message=rate_error,
-            )
-            st.session_state["currency_display"] = currency_display
-            st.caption(f"Country: {resolution.country} ({resolution.method})")
-            if currency_display.fallback_message:
-                st.caption(currency_display.fallback_message)
-            elif currency_display.converted:
-                st.caption(
-                    f"USD to {currency_display.display_currency_code} rate updated "
-                    f"{currency_display.rate_updated_at_utc}. Display conversion only."
-                )
-            else:
-                st.caption("USD base currency; no conversion applied.")
-            st.markdown(
-                '[Rates by ExchangeRate-API](https://www.exchangerate-api.com)',
-                unsafe_allow_html=False,
-            )
-
         st.divider()
         with st.expander("Solver & routing settings", expanded=False):
             st.caption("QAOA executes locally on Qiskit Aer.")
@@ -248,38 +188,17 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
             st.caption(
                 "Optional public OSRM table lookup. If unavailable, local coordinate estimates are used."
             )
-            st.caption("Map basemap tiles are provided by OpenStreetMap.")
+            st.caption("Costs use Indian Rupees (INR). Map tiles are provided by OpenStreetMap.")
     return QAOAConfig(reps=int(reps), maxiter=int(maxiter), shots=int(shots), seed=int(seed)), use_osrm, page
 
 
-def _currency_display() -> CurrencyDisplay:
-    return st.session_state.get(
-        "currency_display",
-        build_currency_display(DEFAULT_COUNTRY, None),
-    )
+def _format_money(amount_in_cost_units: float) -> str:
+    return format_cost(amount_in_cost_units)
 
 
-def _format_money(amount_in_usd: float) -> str:
-    return _currency_display().format_money(amount_in_usd)
-
-
-def _format_money_delta(amount_in_usd: float) -> str:
-    formatted = _currency_display().format_money(abs(amount_in_usd))
-    return f"-{formatted}" if amount_in_usd < 0 else f"+{formatted}"
-
-
-def _render_currency_status() -> None:
-    display = _currency_display()
-    if display.fallback_message:
-        st.warning(display.fallback_message)
-    elif display.converted:
-        st.caption(
-            f"Displaying USD-based amounts in {display.country} ({display.display_currency_code}) "
-            f"using daily {display.rate_source} rates updated {display.rate_updated_at_utc}. "
-            "Optimization inputs and calculations remain in USD base units."
-        )
-    else:
-        st.caption("Displaying USD base amounts. Optimization calculations are unchanged.")
+def _format_money_delta(amount_in_cost_units: float) -> str:
+    formatted = _format_money(abs(amount_in_cost_units))
+    return f"-{formatted}" if amount_in_cost_units < 0 else f"+{formatted}"
 
 
 def _render_page_header(page: str, current: dict[str, object] | None) -> None:
@@ -454,17 +373,18 @@ def _render_scenario_form() -> tuple[bool, dict[str, object]]:
         fuel_type = fuel_col.selectbox("Fuel / energy", tuple(FUEL_OPTIONS), index=0)
         fuel = FUEL_OPTIONS[fuel_type]
         fuel_price = price_col.number_input(
-            f"Fuel price (USD / {fuel['unit']})",
+            f"Fuel price (₹ / {fuel['unit']})",
             min_value=0.0,
             max_value=1000.0,
-            value=float(fuel["default_price"]),
-            step=0.05,
-        )
-        price_col.caption(
-            f"Display equivalent: {_format_money(float(fuel_price))} per {fuel['unit']} (reference only)"
+            value=float(fuel["default_price"] * INR_PER_COST_UNIT),
+            step=0.5,
         )
         driver_cost = labor_col.number_input(
-            "Driver cost per hour (USD)", min_value=0.0, max_value=1000.0, value=25.0, step=1.0
+            "Driver cost per hour (₹)",
+            min_value=0.0,
+            max_value=10000.0,
+            value=25.0 * INR_PER_COST_UNIT,
+            step=50.0,
         )
         objective_name = st.selectbox(
             "Optimization Objective",
@@ -475,8 +395,7 @@ def _render_scenario_form() -> tuple[bool, dict[str, object]]:
         )
         st.caption(
             "Objective = estimated fuel/energy cost by distance + driver cost by elapsed time. "
-            "Inputs and physical costs use USD base units; objective metrics are normalized. "
-            "Currency conversion affects display only."
+            "Inputs and physical costs are shown in INR; objective metrics are normalized."
         )
 
         rows = st.data_editor(
@@ -532,8 +451,8 @@ def _run_from_form(
             shift_end_min=_time_to_minutes(values["shift_end"]),
             traffic_condition=values["traffic"],
             fuel_type=values["fuel_type"],
-            fuel_price_per_unit=values["fuel_price"],
-            driver_cost_per_hour=values["driver_cost"],
+            fuel_price_per_unit=inr_to_cost_units(values["fuel_price"]),
+            driver_cost_per_hour=inr_to_cost_units(values["driver_cost"]),
             use_osrm=use_osrm,
         )
         previous = st.session_state.get("current_run")
@@ -632,7 +551,6 @@ def _render_route_map(
             show_classical,
             show_quantum,
             comparison,
-            currency_display=_currency_display(),
         )
         st_folium(route_map.map, height=520, use_container_width=True, returned_objects=[])
         st.caption(route_map.geometry_status)
@@ -843,25 +761,26 @@ def _render_dynamic_routing(qaoa_config: QAOAConfig) -> None:
         f'<span>{traffic_label}</span></div>',
         unsafe_allow_html=True,
     )
-    condition_col, fleet_col, fuel_col, source_col = st.columns(4)
-    condition_col.metric("Current traffic", scenario.traffic_condition)
-    vehicle = scenario.vehicles[0]
-    fleet_col.metric(
-        "Fleet",
-        f"{len(scenario.vehicles)} vehicles / {vehicle.capacity:g} capacity each",
-    )
-    fuel_col.metric(
-        "Fuel / energy",
-        f"{scenario.fuel_type} @ {scenario.fuel_price_per_unit:g}/{scenario.fuel_unit}",
-    )
-    source_col.metric(
-        "Travel data",
-        "OSRM road matrix"
-        if scenario.osrm_active
-        else "Local fallback"
-        if scenario.osrm_requested
-        else "Local estimate",
-    )
+    with st.container(key="dynamic_traffic_metrics"):
+        condition_col, fleet_col, fuel_col, source_col = st.columns(4)
+        condition_col.metric("Current traffic", scenario.traffic_condition)
+        vehicle = scenario.vehicles[0]
+        fleet_col.metric(
+            "Fleet",
+            f"{len(scenario.vehicles)} vehicles / {vehicle.capacity:g} capacity each",
+        )
+        fuel_col.metric(
+            "Fuel / energy",
+            f"{scenario.fuel_type} @ {_format_money(scenario.fuel_price_per_unit)}/{scenario.fuel_unit}",
+        )
+        source_col.metric(
+            "Travel data",
+            "OSRM road matrix"
+            if scenario.osrm_active
+            else "Local fallback"
+            if scenario.osrm_requested
+            else "Local estimate",
+        )
     incident_names = {
         "Calm": "Traffic clears (Calm)",
         "Normal": "Normal traffic",
@@ -1082,8 +1001,7 @@ def _render_fleet_disruption_result(result: FleetDisruptionResult) -> None:
     st.markdown("## Before vs After fleet plan")
     st.caption(
         f"Traffic: {result.before_scenario.traffic_condition} -> "
-        f"{result.after_scenario.traffic_condition}. Costs are display-converted; "
-        "route optimization values remain in USD base units."
+        f"{result.after_scenario.traffic_condition}. All displayed operating costs use INR."
     )
     if result.error:
         st.error(result.error)
@@ -1407,7 +1325,7 @@ def _render_demo_baseline(demo: HackathonDemoResult) -> None:
 
     st.caption(
         f"Depot: {scenario.location_names['depot']} | Fuel: {scenario.fuel_type} | "
-        f"Fuel price input: {_format_money(scenario.fuel_price_per_unit)} / {scenario.fuel_unit} | "
+        f"Fuel price input: {_format_money(scenario.fuel_price_per_unit)} per {scenario.fuel_unit} | "
         f"Travel data: {scenario.data_source}"
     )
     fleet_rows = [
@@ -2295,13 +2213,12 @@ def _benchmark_table(results: tuple[BenchmarkResult, ...]) -> pd.DataFrame:
 def _benchmark_chart(
     results: tuple[BenchmarkResult, ...], metric: str, axis_title: str
 ) -> alt.Chart:
-    currency = _currency_display()
     if metric == "objective":
-        axis_title = f"Objective ({currency.display_currency_code})"
+        axis_title = "Objective (₹)"
     chart_rows = []
     for result in results:
         classical_value = (
-            currency.convert_amount(result.classical_objective)
+            cost_units_to_inr(result.classical_objective)
             if metric == "objective"
             else result.classical_runtime_seconds
         )
@@ -2315,7 +2232,7 @@ def _benchmark_chart(
         )
         quantum_value = result.qaoa_runtime_seconds
         if metric == "objective" and result.qaoa_objective is not None:
-            quantum_value = currency.convert_amount(result.qaoa_objective)
+            quantum_value = cost_units_to_inr(result.qaoa_objective)
         if quantum_value is not None:
             chart_rows.append(
                 {
@@ -2331,20 +2248,28 @@ def _benchmark_chart(
         alt.Chart(chart_data)
         .mark_point(filled=True, size=90)
         .encode(
-            x=alt.X("Value:Q", title=axis_title),
+            x=alt.X(
+                "Value:Q",
+                title=axis_title,
+                axis=alt.Axis(format=",.2f"),
+            ),
             y=alt.Y("Series:N", title=None, axis=alt.Axis(labelLimit=300)),
             color=alt.Color(
                 "Solver:N",
                 scale=alt.Scale(
                     domain=["Classical exact", "QAOA / Aer"],
-                    range=["#2B6A4B", "#7B1E2D"],
+                    range=["#D6B15D", "#A0445C"],
                 ),
                 legend=alt.Legend(orient="top"),
             ),
             tooltip=[
                 alt.Tooltip("Scenario:N", title="Scenario"),
                 alt.Tooltip("Solver:N", title="Solver"),
-                alt.Tooltip("Value:Q", title=axis_title, format=".4f"),
+                alt.Tooltip(
+                    "Value:Q",
+                    title=axis_title,
+                    format=",.2f" if metric == "objective" else ",.3f",
+                ),
             ],
         )
         .properties(height=max(260, len(chart_rows) * 30))
@@ -2352,13 +2277,13 @@ def _benchmark_chart(
             background="transparent",
             view={"stroke": "transparent"},
             axis={
-                "labelColor": "#2B0D19",
-                "titleColor": "#2B0D19",
-                "gridColor": "#D8B98E",
-                "domainColor": "#6A3F4A",
-                "tickColor": "#6A3F4A",
+                "labelColor": "#F2EBDD",
+                "titleColor": "#F2EBDD",
+                "gridColor": "#49353B",
+                "domainColor": "#76535C",
+                "tickColor": "#76535C",
             },
-            legend={"labelColor": "#2B0D19", "titleColor": "#2B0D19"},
+            legend={"labelColor": "#F2EBDD", "titleColor": "#F2EBDD"},
         )
     )
 

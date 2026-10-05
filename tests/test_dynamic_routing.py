@@ -101,10 +101,13 @@ class DynamicRoutingTests(unittest.TestCase):
             self.assertTrue(comparison.after_run.quantum_error)
         self.assertIsNotNone(comparison.classical)
         self.assertIsNotNone(comparison.quantum)
+        after_run = comparison.after_run
+        if after_run is None:
+            self.fail("traffic re-optimization did not return an updated run")
 
         map_view = build_route_map(
             comparison.after_scenario,
-            comparison.after_run,
+            after_run,
             traffic_comparison=comparison,
         )
         map_html = map_view.map.get_root().render()

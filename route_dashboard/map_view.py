@@ -6,13 +6,13 @@ from html import escape
 import folium
 
 from .dynamic import TrafficReoptimization
-from .currency import CurrencyDisplay, format_currency
+from .currency import format_cost
 from .optimization import OptimizationRun, RouteSummary
 from .routing import get_osrm_route_geometry
 from .scenario import ScenarioProblem
 
 
-ROUTE_COLORS = ("#087f5b", "#e76f51", "#3a6ea5", "#b56576", "#6b705c")
+ROUTE_COLORS = ("#922D49", "#B48632", "#34775A", "#65558E", "#237A7A")
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,6 @@ def build_route_map(
     show_classical: bool = True,
     show_quantum: bool = True,
     traffic_comparison: TrafficReoptimization | None = None,
-    currency_display: CurrencyDisplay | None = None,
 ) -> RouteMapView:
     depot = scenario.coordinates["depot"]
     route_map = folium.Map(
@@ -104,11 +103,7 @@ def build_route_map(
                 elif geometry_error:
                     geometry_errors.append(geometry_error)
             geometry_modes.append(used_osrm_geometry)
-            route_cost = (
-                currency_display.format_money(route.total_cost)
-                if currency_display is not None
-                else format_currency(route.total_cost, "USD")
-            )
+            route_cost = format_cost(route.total_cost)
             destination_names = [
                 escape(route_scenario.location_names[delivery_id])
                 for delivery_id in route.plan.delivery_ids

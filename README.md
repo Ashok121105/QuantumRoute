@@ -121,9 +121,9 @@ a hardware execution.
 
 | Method | Distance | Travel time | Cost | Fuel | CO2 |
 |---|---:|---:|---:|---:|---:|
-| Classical Optimization | 18.225 km | 34.171 min | $21.814 | 1.640 L | 4.396 kg |
-| Local Aer QAOA | 18.225 km | 34.171 min | $21.814 | 1.640 L | 4.396 kg |
-| REAL IBM QUANTUM HARDWARE (`ibm_fez`, 256 shots, DONE) | approximately 18.22 km | approximately 34 min | approximately $21.81 | 1.640 L | 4.396 kg |
+| Classical Optimization | 18.225 km | 34.171 min | ₹1,854.19 | 1.640 L | 4.396 kg |
+| Local Aer QAOA | 18.225 km | 34.171 min | ₹1,854.19 | 1.640 L | 4.396 kg |
+| REAL IBM QUANTUM HARDWARE (`ibm_fez`, 256 shots, DONE) | approximately 18.22 km | approximately 34 min | approximately ₹1,853.85 | 1.640 L | 4.396 kg |
 
 The completed IBM hardware result passed the existing feasibility validation.
 The hardware measures bitstrings; the displayed distance, time, cost, fuel,
@@ -140,11 +140,11 @@ unchanged because the configured fuel/emissions model depends on distance:
 
 | Traffic | Distance | Travel time | Cost | Fuel | CO2 |
 |---|---:|---:|---:|---:|---:|
-| Normal | approximately 18.225 km | approximately 34.171 min | approximately $21.814 | 1.640 L | 4.396 kg |
-| Heavy | approximately 18.225 km | approximately 52.965 min | approximately $29.382 | 1.640 L | 4.396 kg |
+| Normal | approximately 18.225 km | approximately 34.171 min | approximately ₹1,854.19 | 1.640 L | 4.396 kg |
+| Heavy | approximately 18.225 km | approximately 52.965 min | approximately ₹2,497.47 | 1.640 L | 4.396 kg |
 
 In the standalone objective comparison, Green Priority produced approximately
-17.803 km, 33.382 min, $29.324 cost, 1.602 L fuel, and 4.294 kg CO2. This is a
+17.803 km, 33.382 min, ₹2,492.54 cost, 1.602 L fuel, and 4.294 kg CO2. This is a
 different trade-off from the cost-focused baseline. Objective scores are
 normalized for their respective profiles and are not directly rankable across
 profiles; there is no universally best route.
@@ -220,36 +220,15 @@ tailpipe CO2, not zero lifecycle or grid emissions. Displayed changes are
 After - Before, not claimed savings. Fleet rows come from revalidated vehicle
 routes and are checked for unique delivery assignment and capacity.
 
-## Day 6: Country and currency display
+## Day 6: INR cost presentation
 
-Use **Location & currency** in the sidebar to choose **Auto Detect** or
-**Manual country selection**. Auto Detect reads the browser's `Accept-Language`
-region only; it does not request GPS, IP geolocation, or other sensitive
-information. If no supported region is present, India/INR is the default.
-Manual selection always takes precedence.
-
-Country choices include India (INR), USA (USD), UK (GBP), euro-area countries
-(EUR), Japan (JPY), Australia (AUD), Canada (CAD), Singapore (SGD), UAE (AED),
-and a broader set across Europe, Asia, Africa, and the Americas. Amounts shown
-in another currency are converted from the application's USD base amounts
-using the public [ExchangeRate-API open access rates](https://www.exchangerate-api.com/).
-The feed updates daily, is cached for 24 hours in the running Streamlit app,
-and its reported update time is shown in the UI. Provider attribution is
-included in the currency panel.
-
-Currency conversion is strictly presentational. The optimizer, QUBO, QAOA,
-benchmark inputs, and objective values remain unchanged and currency-neutral;
-the app's configured fuel and driver cost inputs are explicitly denominated in
-USD base units. Fuel-price equivalents shown in the selected currency are
-reference conversions, not local market-price quotes. Benchmark objectives
-are converted only for tables and chart display; recorded benchmark values and
-relative gaps remain as computed.
-
-If the exchange-rate service is unreachable or does not provide the selected
-currency, the app continues using USD and explicitly labels amounts as USD
-instead of attaching an unsupported local symbol. Auto-detected country uses
-browser locale rather than physical location, and the daily rate is not a live
-transaction quote.
+All dashboard operating costs and editable fuel/driver inputs are presented in
+Indian Rupees. Built-in input values are shown using a fixed reference factor
+of ₹85 per model cost unit; the existing solver cost scale is retained, so
+currency presentation does not change the optimizer, QUBO, QAOA, or benchmark
+calculations. Fuel and driver defaults therefore appear as realistic rupee
+amounts without relabeling the original smaller model-unit values as rupees.
+The reference factor is a display convention, not a live exchange quote.
 
 ## Day 7: Fleet disruption recovery
 
@@ -282,9 +261,9 @@ traffic profile uses the existing traffic-matrix recalculation before fleet
 re-optimization. This is a simulated breakdown and traffic scenario, not a
 live fleet or GPS feed.
 
-Displayed costs continue to use the global currency selector. Optimization
-costs and benchmark calculations remain in their configured USD base units;
-currency conversion is presentation-only.
+Displayed costs and editable operating-cost inputs use Indian Rupees. The
+dashboard converts edited INR inputs to the existing model cost scale before
+optimization and formats computed costs back to INR for display.
 
 ## Day 8: Multi-objective route optimization
 
@@ -310,7 +289,7 @@ candidate-route extrema. Distance is scaled by the largest travel-matrix arc
 times a conservative maximum route-leg count. Elapsed time is scaled by the
 sum of vehicle shift durations. Cost, fuel, and CO2 scales derive from those
 bounds and configured physical inputs. Each component is divided by its
-positive scale before the profile weights are applied, so dollars, minutes,
+positive scale before the profile weights are applied, so cost units, minutes,
 liters, and kilograms are not added as raw values.
 
 The objective layer translates the normalized terms into additive route
@@ -325,7 +304,7 @@ is implied.
 
 Benchmark Mode remains fixed to Cost Priority so its deterministic cases stay
 comparable across runs. Benchmark calculations are unchanged; only monetary
-display follows the global currency selection. Normalization is a deterministic
+display uses the INR reference factor. Normalization is a deterministic
 reference-scale model, not a claim that every business preference or lifecycle
 environmental impact is represented.
 
@@ -460,8 +439,6 @@ python -m unittest discover -s tests -v
 - OpenStreetMap, for map tiles when displayed: [copyright and attribution](https://www.openstreetmap.org/copyright).
 - OSRM, for optional road-routing tables and route geometry:
 	[project site](https://project-osrm.org/).
-- ExchangeRate-API, for optional presentational currency conversion:
-	[open access rates](https://www.exchangerate-api.com/).
 
 The built-in routing scenarios are generated by this project; no external
 delivery dataset is claimed. **Official VNQFF-08 organizer source:** to be
