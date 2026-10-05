@@ -355,19 +355,71 @@ def _render_dashboard(current: dict[str, object] | None) -> None:
         st.markdown("### Latest fleet re-optimization")
         _render_fleet_before_after(disruption)
         _render_waitlist(disruption)
-        st.markdown("### Updated fleet map")
-        _render_route_map(disruption.after_scenario, disruption.after_run, None)
+        map_column, details_column = st.columns([1.7, 1], gap="large")
+        with map_column:
+            _render_route_map(disruption.after_scenario, disruption.after_run, None)
+        with details_column:
+            _render_dashboard_route_details(
+                disruption.optimization_scenario,
+                disruption.after_run,
+            )
         st.markdown("### Updated optimization methods")
         _render_comparison(disruption.optimization_scenario, disruption.after_run)
         _render_fleet_view(disruption.optimization_scenario, disruption.after_run)
     elif current is not None:
         scenario = current["scenario"]
         run = current["run"]
-        st.markdown("### Route map")
-        _render_route_map(scenario, run, st.session_state.get("dynamic_comparison"))
+        map_column, details_column = st.columns([1.7, 1], gap="large")
+        with map_column:
+            _render_route_map(scenario, run, st.session_state.get("dynamic_comparison"))
+        with details_column:
+            _render_dashboard_route_details(scenario, run)
         st.markdown("### Optimization methods")
         _render_comparison(scenario, run)
         _render_fleet_view(scenario, run)
+
+
+def _render_dashboard_route_details(
+    scenario: ScenarioProblem,
+    run: OptimizationRun,
+) -> None:
+    st.markdown("### Route details")
+    classical_impact = calculate_route_impact(scenario, run.classical)
+    with st.container(border=True):
+        st.markdown("#### Classical plan")
+        st.caption(classical_impact.route_description or "No route")
+        metrics = st.columns(2)
+        metrics[0].metric("Distance", f"{classical_impact.distance_km:.2f} km")
+        metrics[1].metric("Travel time", _format_duration(classical_impact.travel_time_min))
+        st.caption(
+            f"Cost {_format_money(classical_impact.cost)} · "
+            f"Fuel {classical_impact.fuel_used:.3f} {classical_impact.fuel_unit} · "
+            f"CO2 {classical_impact.tailpipe_co2_kg:.3f} kg"
+        )
+        st.success("Validated route set")
+
+    if run.quantum is None:
+        st.info(
+            "No valid local Aer route is available. The existing QAOA status is shown below; "
+            "no substitute result is used."
+        )
+        if run.quantum_error:
+            st.caption(run.quantum_error)
+        return
+
+    quantum_impact = calculate_route_impact(scenario, run.quantum)
+    with st.container(border=True):
+        st.markdown("#### QAOA / Local Aer")
+        st.caption(quantum_impact.route_description or "No route")
+        metrics = st.columns(2)
+        metrics[0].metric("Distance", f"{quantum_impact.distance_km:.2f} km")
+        metrics[1].metric("Travel time", _format_duration(quantum_impact.travel_time_min))
+        st.caption(
+            f"Cost {_format_money(quantum_impact.cost)} · "
+            f"Fuel {quantum_impact.fuel_used:.3f} {quantum_impact.fuel_unit} · "
+            f"CO2 {quantum_impact.tailpipe_co2_kg:.3f} kg"
+        )
+        st.success("Validated route set")
 
 
 def _navigate_to_optimization() -> None:
@@ -444,7 +496,7 @@ def _render_scenario_form() -> tuple[bool, dict[str, object]]:
             key="delivery_editor",
         )
         st.markdown("## 03 / Optimization")
-        submitted = st.form_submit_button("Run optimization", type="primary", width="stretch")
+        submitted = st.form_submit_button("Run optimization", type="primary", use_container_width=True)
 
     return submitted, {
         "depot_name": depot_name,
