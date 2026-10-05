@@ -2337,7 +2337,7 @@ def _benchmark_chart(
                 "Solver:N",
                 scale=alt.Scale(
                     domain=["Classical exact", "QAOA / Aer"],
-                    range=["#087f5b", "#e76f51"],
+                    range=["#2B6A4B", "#7B1E2D"],
                 ),
                 legend=alt.Legend(orient="top"),
             ),
@@ -2351,8 +2351,14 @@ def _benchmark_chart(
         .configure(
             background="transparent",
             view={"stroke": "transparent"},
-            axis={"labelColor": "#c5d1e2", "titleColor": "#c5d1e2", "gridColor": "#29364d"},
-            legend={"labelColor": "#c5d1e2", "titleColor": "#c5d1e2"},
+            axis={
+                "labelColor": "#2B0D19",
+                "titleColor": "#2B0D19",
+                "gridColor": "#D8B98E",
+                "domainColor": "#6A3F4A",
+                "tickColor": "#6A3F4A",
+            },
+            legend={"labelColor": "#2B0D19", "titleColor": "#2B0D19"},
         )
     )
 
