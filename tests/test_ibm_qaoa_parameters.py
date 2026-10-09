@@ -52,6 +52,17 @@ class IBMQAOAParameterTests(unittest.TestCase):
         self.assertLessEqual(package.required_qubits, 5)
         self.assertEqual(len(package.circuit.parameters), 0)
         self.assertTrue(package.validation.local_transpilation_passed)
+        self.assertIsNotNone(package.formulation)
+        self.assertIsNotNone(package.scenario)
+        self.assertIsNotNone(package.objective_scenario)
+        self.assertIsNotNone(package.logical_circuit)
+        self.assertIsNotNone(package.measured_circuit)
+        self.assertEqual(
+            package.optimizer_metadata["configuration"],
+            {"reps": 1, "maxiter": 8, "shots": 256, "seed": 42},
+        )
+        self.assertEqual(len(package.optimizer_metadata["initial_point"]), 2)
+        self.assertTrue(package.optimizer_metadata["history"])
 
     def test_unavailable_optimizer_parameters_are_explicit(self) -> None:
         formulation = build_demo_route_qubo()

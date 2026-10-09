@@ -1,7 +1,9 @@
 """Streamlit dashboard for scenario setup, optimization, and route inspection."""
 
 from datetime import time
+from hashlib import sha256
 from math import isclose
+from pathlib import Path
 
 import altair as alt
 import pandas as pd
@@ -20,7 +22,11 @@ from .demo_mode import (
     reset_demo_state,
     run_full_demo,
 )
-from .map_view import build_route_map
+from .map_view import (
+    ScoredRoadAlternative,
+    build_route_map,
+    rank_road_alternatives,
+)
 from .benchmark_suite import BenchmarkResult, generate_benchmark_scenarios, run_benchmark
 from .currency import (
     INR_PER_COST_UNIT,
@@ -37,6 +43,12 @@ from .fleet_disruption import (
     build_fleet_disruption_demo_scenario,
     reoptimize_fleet,
 )
+from .history import (
+    SQLiteOperationHistory,
+    build_operation_record,
+    new_run_id,
+)
+from .history_ui import render_history_page
 from ibm_quantum import (
     IBMBackendDiscovery,
     IBMBackendMetadata,
@@ -53,6 +65,7 @@ from ibm_execution import (
     refresh_hardware_job_status,
     submit_confirmed_hardware_job,
 )
+from ibm_hardware_evidence import HardwareEvidenceError, write_hardware_evidence
 from ibm_qaoa_adapter import build_demo_route_qubo, route_qubo_fingerprint
 from ibm_qaoa_parameters import (
     DEFAULT_DEMO_QAOA_CONFIG,
@@ -72,6 +85,7 @@ from .scenario import (
     build_scenario,
     demo_stops,
 )
+from .routing import get_osrm_route_alternatives
 from .theme import apply_theme
 
 
@@ -99,8 +113,14 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    if st.session_state.pop("history_navigation_requested", False):
+        st.session_state["active_page"] = "Route Optimization"
+    _apply_history_plan_draft()
     apply_theme()
     qaoa_config, use_osrm, page = _render_sidebar()
+    history_error = st.session_state.get("history_write_error")
+    if history_error:
+        st.warning(history_error)
     current = st.session_state.get("current_run")
     disruption = st.session_state.get("fleet_disruption_result")
     if current is None and disruption is not None and disruption.after_run is not None:
@@ -109,6 +129,9 @@ def main() -> None:
     if page == "Dashboard":
         _render_dashboard(current)
     elif page == "Route Optimization":
+        plan_notice = st.session_state.pop("history_plan_notice", None)
+        if plan_notice:
+            st.info(plan_notice)
         submitted, form_values = _render_scenario_form()
         if submitted:
             _run_from_form(form_values, qaoa_config, use_osrm)
@@ -138,6 +161,8 @@ def main() -> None:
         _render_fleet_disruption(qaoa_config)
     elif page == "Demo Mode":
         _render_demo_mode()
+    elif page == "History":
+        render_history_page()
     elif page == "IBM Quantum Hardware":
         _render_ibm_quantum_hardware()
     else:
@@ -160,6 +185,7 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
             "Demo Mode": "slideshow",
             "Benchmark Mode": "query_stats",
             "IBM Quantum Hardware": "memory",
+            "History": "history",
         }
         page = st.radio(
             "Workspace navigation",
@@ -171,6 +197,7 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
                 "IBM Quantum Hardware",
                 "Demo Mode",
                 "Benchmark Mode",
+                "History",
             ),
             format_func=lambda value: f":material/{nav_icons[value]}: {value}",
             key="active_page",
@@ -184,7 +211,13 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
             maxiter = st.number_input("Optimizer iterations", min_value=5, max_value=100, value=25, step=5)
             shots = st.number_input("Sampler shots", min_value=128, max_value=4096, value=1024, step=128)
             seed = st.number_input("Random seed", min_value=0, max_value=2_147_483_647, value=7, step=1)
-            use_osrm = st.checkbox("Request OSRM travel matrix", value=False)
+            defaults = st.session_state.get("scenario_form_defaults", {})
+            defaults = defaults if isinstance(defaults, dict) else {}
+            use_osrm = st.checkbox(
+                "Request OSRM travel matrix",
+                value=bool(defaults.get("use_osrm", False)),
+                key=_scenario_widget_key("scenario_use_osrm"),
+            )
             st.caption(
                 "Optional public OSRM table lookup. If unavailable, local coordinate estimates are used."
             )
@@ -210,6 +243,7 @@ def _render_page_header(page: str, current: dict[str, object] | None) -> None:
         "Demo Mode": "Demo Mode",
         "Benchmark Mode": "Benchmark laboratory",
         "IBM Quantum Hardware": "IBM Quantum Hardware",
+        "History": "Operation history",
     }
     header, action = st.columns([8, 2], vertical_alignment="center")
     with header:
@@ -346,52 +380,102 @@ def _navigate_to_optimization() -> None:
 
 
 def _render_scenario_form() -> tuple[bool, dict[str, object]]:
+    defaults = st.session_state.get("scenario_form_defaults", {})
+    defaults = defaults if isinstance(defaults, dict) else {}
+    delivery_defaults = defaults.get("delivery_rows", DEFAULT_ROWS)
+    traffic_options = ("Calm", "Normal", "Moderate", "Heavy", "Storm")
+    fuel_options = tuple(FUEL_OPTIONS)
     with st.form("route_scenario"):
         st.markdown("## 01 / Scenario setup")
         depot_col, latitude_col, longitude_col = st.columns([1.3, 1, 1])
-        depot_name = depot_col.text_input("Depot name", value="Mission Depot")
+        depot_name = depot_col.text_input(
+            "Depot name",
+            value=defaults.get("depot_name", "Mission Depot"),
+            key=_scenario_widget_key("scenario_depot_name"),
+        )
         depot_latitude = latitude_col.number_input(
-            "Depot latitude", min_value=-90.0, max_value=90.0, value=37.7749, format="%.5f"
+            "Depot latitude",
+            min_value=-90.0,
+            max_value=90.0,
+            value=defaults.get("depot_latitude", 37.7749),
+            format="%.5f",
+            key=_scenario_widget_key("scenario_depot_latitude"),
         )
         depot_longitude = longitude_col.number_input(
-            "Depot longitude", min_value=-180.0, max_value=180.0, value=-122.4194, format="%.5f"
+            "Depot longitude",
+            min_value=-180.0,
+            max_value=180.0,
+            value=defaults.get("depot_longitude", -122.4194),
+            format="%.5f",
+            key=_scenario_widget_key("scenario_depot_longitude"),
         )
 
         st.markdown("## 02 / Delivery & vehicle constraints")
         vehicle_col, capacity_col, start_col, end_col = st.columns(4)
-        vehicle_count = vehicle_col.number_input("Vehicles", min_value=1, max_value=8, value=2)
-        capacity = capacity_col.number_input("Capacity per vehicle", min_value=0.1, max_value=1000.0, value=2.0, step=0.5)
-        shift_start = start_col.time_input("Shift starts", value=time(8, 0))
-        shift_end = end_col.time_input("Shift ends", value=time(17, 0))
+        vehicle_count = vehicle_col.number_input(
+            "Vehicles",
+            min_value=1,
+            max_value=8,
+            value=defaults.get("vehicle_count", 2),
+            key=_scenario_widget_key("scenario_vehicle_count"),
+        )
+        capacity = capacity_col.number_input(
+            "Capacity per vehicle",
+            min_value=0.1,
+            max_value=1000.0,
+            value=defaults.get("capacity", 2.0),
+            step=0.5,
+            key=_scenario_widget_key("scenario_capacity"),
+        )
+        shift_start = start_col.time_input(
+            "Shift starts",
+            value=defaults.get("shift_start", time(8, 0)),
+            key=_scenario_widget_key("scenario_shift_start"),
+        )
+        shift_end = end_col.time_input(
+            "Shift ends",
+            value=defaults.get("shift_end", time(17, 0)),
+            key=_scenario_widget_key("scenario_shift_end"),
+        )
 
         traffic_col, fuel_col, price_col, labor_col = st.columns(4)
         traffic = traffic_col.selectbox(
             "Traffic condition",
-            ("Calm", "Normal", "Moderate", "Heavy", "Storm"),
-            index=2,
+            traffic_options,
+            index=traffic_options.index(defaults.get("traffic", "Moderate")),
+            key=_scenario_widget_key("scenario_traffic"),
         )
-        fuel_type = fuel_col.selectbox("Fuel / energy", tuple(FUEL_OPTIONS), index=0)
+        fuel_type = fuel_col.selectbox(
+            "Fuel / energy",
+            fuel_options,
+            index=fuel_options.index(defaults.get("fuel_type", fuel_options[0])),
+            key=_scenario_widget_key("scenario_fuel_type"),
+        )
         fuel = FUEL_OPTIONS[fuel_type]
         fuel_price = price_col.number_input(
             f"Fuel price (₹ / {fuel['unit']})",
             min_value=0.0,
             max_value=1000.0,
-            value=float(fuel["default_price"] * INR_PER_COST_UNIT),
+            value=defaults.get(
+                "fuel_price", float(fuel["default_price"] * INR_PER_COST_UNIT)
+            ),
             step=0.5,
+            key=_scenario_widget_key("scenario_fuel_price"),
         )
         driver_cost = labor_col.number_input(
             "Driver cost per hour (₹)",
             min_value=0.0,
             max_value=10000.0,
-            value=25.0 * INR_PER_COST_UNIT,
+            value=defaults.get("driver_cost", 25.0 * INR_PER_COST_UNIT),
             step=50.0,
+            key=_scenario_widget_key("scenario_driver_cost"),
         )
         objective_name = st.selectbox(
             "Optimization Objective",
             tuple(objective.value for objective in ObjectiveName),
             index=0,
             format_func=lambda value: f"{value}: {OBJECTIVE_DESCRIPTIONS[ObjectiveName(value)]}",
-            key="route_optimization_objective",
+            key=_scenario_widget_key("route_optimization_objective"),
         )
         st.caption(
             "Objective = estimated fuel/energy cost by distance + driver cost by elapsed time. "
@@ -399,7 +483,7 @@ def _render_scenario_form() -> tuple[bool, dict[str, object]]:
         )
 
         rows = st.data_editor(
-            pd.DataFrame(DEFAULT_ROWS),
+            pd.DataFrame(delivery_defaults),
             num_rows="dynamic",
             hide_index=True,
             width="stretch",
@@ -412,7 +496,7 @@ def _render_scenario_form() -> tuple[bool, dict[str, object]]:
                 "window_end": st.column_config.TextColumn("Window end (HH:MM)"),
                 "service_minutes": st.column_config.NumberColumn("Service (min)", min_value=0, step=1),
             },
-            key="delivery_editor",
+            key=_scenario_widget_key("delivery_editor"),
         )
         st.markdown("## 03 / Optimization")
         submitted = st.form_submit_button("Run optimization", type="primary", use_container_width=True)
@@ -432,6 +516,98 @@ def _render_scenario_form() -> tuple[bool, dict[str, object]]:
         "objective": objective_name,
         "delivery_rows": rows.to_dict(orient="records"),
     }
+
+
+def _apply_history_plan_draft() -> None:
+    draft = st.session_state.pop("history_plan_draft", None)
+    if not isinstance(draft, dict):
+        return
+    origin = draft.get("origin")
+    destinations = draft.get("destinations")
+    vehicles = draft.get("vehicles")
+    fuel = draft.get("fuel")
+    traffic = draft.get("traffic")
+    if not all(isinstance(value, dict) for value in (origin, fuel, traffic)):
+        st.session_state["history_plan_notice"] = (
+            "The saved inputs could not be loaded because their structure is unsupported."
+        )
+        return
+    if not isinstance(destinations, list) or not isinstance(vehicles, list) or not vehicles:
+        st.session_state["history_plan_notice"] = (
+            "The saved inputs do not contain editable delivery and vehicle data."
+        )
+        return
+    if not all(isinstance(item, dict) for item in destinations + vehicles):
+        st.session_state["history_plan_notice"] = (
+            "The saved inputs contain an unsupported delivery or vehicle record."
+        )
+        return
+    editor_key = st.session_state.pop(
+        "history_plan_editor_key", new_run_id()
+    )
+    first_vehicle = vehicles[0]
+    if not isinstance(first_vehicle, dict):
+        st.session_state["history_plan_notice"] = "The saved vehicle inputs are invalid."
+        return
+    st.session_state["scenario_form_key_suffix"] = editor_key
+    st.session_state["scenario_form_defaults"] = {
+        "depot_name": origin.get("name", "Mission Depot"),
+        "depot_latitude": float(origin.get("latitude", 37.7749)),
+        "depot_longitude": float(origin.get("longitude", -122.4194)),
+        "vehicle_count": len(vehicles),
+        "capacity": float(first_vehicle["capacity"]),
+        "shift_start": _minutes_to_time(int(first_vehicle["shift_start_min"])),
+        "shift_end": _minutes_to_time(int(first_vehicle["shift_end_min"])),
+        "traffic": traffic.get("level", "Moderate"),
+        "fuel_type": fuel.get("type", "Diesel"),
+        "fuel_price": cost_units_to_inr(
+            float(fuel.get("price_per_unit_cost_units", 0))
+        ),
+        "driver_cost": cost_units_to_inr(
+            float(fuel.get("cost_weights", {}).get("time_cost_per_min", 0)) * 60
+        ),
+        "objective": draft.get("objective", "Cost Priority"),
+        "use_osrm": traffic.get("travel_data_source")
+        == "OSRM public table service",
+        "delivery_rows": [
+                {
+                    "destination": item["name"],
+                    "latitude": item["latitude"],
+                    "longitude": item["longitude"],
+                    "demand": item["quantity"],
+                    "window_start": _format_time(item["time_window_start_min"]),
+                    "window_end": _format_time(item["time_window_end_min"]),
+                    "service_minutes": item["service_duration_min"],
+                }
+                for item in destinations
+        ],
+    }
+    uniform_vehicles = all(
+        isinstance(vehicle, dict)
+        and vehicle.get("capacity") == first_vehicle.get("capacity")
+        and vehicle.get("shift_start_min") == first_vehicle.get("shift_start_min")
+        and vehicle.get("shift_end_min") == first_vehicle.get("shift_end_min")
+        for vehicle in vehicles
+    )
+    if not uniform_vehicles:
+        st.session_state["history_plan_notice"] = (
+            "Inputs copied where supported, but this editor uses one shared vehicle "
+            "capacity and shift; review the fleet values before starting a new plan."
+        )
+    else:
+        st.session_state["history_plan_notice"] = (
+            "Historical inputs copied into a new plan. Review them before running; "
+            "the saved operation is unchanged."
+        )
+
+
+def _minutes_to_time(minutes: int) -> time:
+    return time(minutes // 60, minutes % 60)
+
+
+def _scenario_widget_key(name: str) -> str:
+    suffix = st.session_state.get("scenario_form_key_suffix", "")
+    return f"{name}_{suffix}" if isinstance(suffix, str) and suffix else name
 
 
 def _run_from_form(
@@ -459,6 +635,14 @@ def _run_from_form(
         with st.spinner("Generating feasible routes and sampling QAOA on local Aer..."):
             objective_config = ObjectiveConfig.for_name(values["objective"])
             run = optimize_with_objective(scenario, objective_config, qaoa_config)
+        history_run_id = new_run_id()
+        st.session_state["current_history_run_id"] = history_run_id
+        _persist_completed_run(
+            scenario,
+            run,
+            run_id=history_run_id,
+            operation_type="OPTIMIZATION",
+        )
         st.session_state["traffic_comparison"] = (
             {"before": previous, "after": {"scenario": scenario, "run": run}}
             if previous and previous["scenario"].traffic_condition != scenario.traffic_condition
@@ -473,6 +657,40 @@ def _run_from_form(
         st.session_state["run_error"] = f"Scenario could not be optimized: {error}"
     except Exception as error:
         st.session_state["run_error"] = f"Optimization failed: {type(error).__name__}: {error}"
+
+
+def _persist_completed_run(
+    scenario: ScenarioProblem,
+    run: OptimizationRun,
+    *,
+    run_id: str,
+    parent_run_id: str | None = None,
+    operation_type: str = "OPTIMIZATION",
+    feasibility_status: str = "VALIDATED",
+    failure_details: str | None = None,
+    reoptimization: dict[str, object] | None = None,
+    extra_inputs: dict[str, object] | None = None,
+) -> bool:
+    try:
+        record = build_operation_record(
+            scenario,
+            run,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            operation_type=operation_type,
+            feasibility_status=feasibility_status,
+            failure_details=failure_details,
+            reoptimization=reoptimization,
+            extra_inputs=extra_inputs,
+        )
+        inserted = SQLiteOperationHistory().save_completed_operation(record)
+    except Exception as error:
+        message = f"Optimization completed, but this run was not saved to history: {error}"
+        st.session_state["history_write_error"] = message
+        st.warning(message)
+        return False
+    st.session_state.pop("history_write_error", None)
+    return inserted
 
 
 def _delivery_stops(rows: list[dict[str, object]]) -> tuple[DeliveryStop, ...]:
@@ -544,6 +762,121 @@ def _render_route_map(
             key=f"{key_prefix}_quantum_routes",
         )
         st.caption("Before-incident routes are dashed; current routes are solid.")
+        location_ids = tuple(scenario.coordinates)
+        location_label = lambda location_id: (
+            f"{scenario.location_names[location_id]} ({location_id})"
+        )
+        with st.form(f"{key_prefix}_road_alternatives_form"):
+            st.markdown("#### Compare one road leg")
+            origin_id = st.selectbox(
+                "Origin",
+                location_ids,
+                format_func=location_label,
+                key=f"{key_prefix}_road_origin",
+            )
+            destination_id = st.selectbox(
+                "Destination",
+                location_ids,
+                index=min(1, len(location_ids) - 1),
+                format_func=location_label,
+                key=f"{key_prefix}_road_destination",
+            )
+            request_alternatives = st.form_submit_button(
+                "Request OSRM alternatives",
+                use_container_width=True,
+            )
+
+        request_key = (
+            origin_id,
+            scenario.coordinates[origin_id],
+            destination_id,
+            scenario.coordinates[destination_id],
+        )
+        results_key = f"{key_prefix}_road_alternatives_result"
+        if request_alternatives:
+            selection_key = _road_alternative_selection_key(key_prefix, request_key)
+            st.session_state.pop(selection_key, None)
+            if (
+                origin_id == destination_id
+                or scenario.coordinates[origin_id] == scenario.coordinates[destination_id]
+            ):
+                st.session_state[results_key] = {
+                    "request_key": request_key,
+                    "alternatives": (),
+                    "error": "Choose origin and destination locations with different coordinates.",
+                }
+            else:
+                alternatives, error = get_osrm_route_alternatives(
+                    scenario.coordinates[origin_id],
+                    scenario.coordinates[destination_id],
+                )
+                st.session_state[results_key] = {
+                    "request_key": request_key,
+                    "alternatives": alternatives,
+                    "error": error,
+                }
+
+        saved_result = st.session_state.get(results_key)
+        scored_alternatives: tuple[ScoredRoadAlternative, ...] = ()
+        alternatives_error = None
+        if saved_result is not None and saved_result["request_key"] == request_key:
+            alternatives_error = saved_result["error"]
+            scored_alternatives = rank_road_alternatives(
+                scenario,
+                run.objective_name,
+                saved_result["alternatives"],
+            )
+        selected_alternative_id = None
+        show_road_alternatives = True
+        if alternatives_error:
+            st.warning(
+                f"OSRM road alternatives unavailable: {alternatives_error}. "
+                "Existing optimizer route layers remain unchanged."
+            )
+        elif saved_result is not None and saved_result["request_key"] == request_key:
+            if not scored_alternatives:
+                st.info(
+                    "OSRM returned no road routes for this leg. No alternative geometry "
+                    "is drawn; existing optimizer route layers remain unchanged."
+                )
+            else:
+                if len(scored_alternatives) == 1:
+                    st.info("OSRM returned one road route; no additional alternative was returned.")
+                recommended = scored_alternatives[0]
+                ids = tuple(item.route.alternative_id for item in scored_alternatives)
+                selection_key = _road_alternative_selection_key(key_prefix, request_key)
+                selected_alternative_id = st.selectbox(
+                    "Selected road alternative",
+                    ids,
+                    index=0,
+                    format_func=lambda alternative_id: _road_alternative_label(
+                        next(item for item in scored_alternatives if item.route.alternative_id == alternative_id)
+                    ),
+                    key=selection_key,
+                )
+                show_road_alternatives = st.checkbox(
+                    "Show road alternatives on map",
+                    value=True,
+                    key=f"{key_prefix}_show_road_alternatives",
+                )
+                st.caption(
+                    f"Recommended: road alternative {recommended.route.returned_order} "
+                    f"({recommended.route.alternative_id}), lowest normalized "
+                    f"{run.objective_name} score among returned OSRM routes. This is a "
+                    "display-only comparison; neither classical optimization nor QAOA "
+                    "selected these road alternatives."
+                )
+                st.caption(
+                    "OSRM duration is a routing estimate, not live traffic. Estimated "
+                    "time applies the scenario's traffic multiplier. Operating cost uses "
+                    "the existing distance/time rates; fixed vehicle cost is excluded "
+                    "because the same leg is being compared."
+                )
+        else:
+            st.caption(
+                "Select one origin-destination leg and explicitly request OSRM alternatives. "
+                "No request is made during unrelated reruns."
+            )
     with map_col:
         route_map = build_route_map(
             scenario,
@@ -551,9 +884,57 @@ def _render_route_map(
             show_classical,
             show_quantum,
             comparison,
+            road_alternatives=scored_alternatives,
+            selected_road_alternative_id=selected_alternative_id,
+            show_road_alternatives=show_road_alternatives,
         )
         st_folium(route_map.map, height=520, use_container_width=True, returned_objects=[])
         st.caption(route_map.geometry_status)
+    if scored_alternatives:
+        st.markdown("#### Road alternative comparison")
+        st.dataframe(
+            _road_alternative_table(scenario, scored_alternatives),
+            hide_index=True,
+            width="stretch",
+        )
+
+
+def _road_alternative_selection_key(
+    key_prefix: str,
+    request_key: tuple[object, ...],
+) -> str:
+    digest = sha256(repr(request_key).encode("utf-8")).hexdigest()[:10]
+    return f"{key_prefix}_road_selection_{digest}"
+
+
+def _road_alternative_label(alternative: ScoredRoadAlternative) -> str:
+    return (
+        f"Road alternative {alternative.route.returned_order} — "
+        f"{alternative.route.distance_km:.1f} km, "
+        f"{alternative.estimated_time_min:.0f} min"
+    )
+
+
+def _road_alternative_table(
+    scenario: ScenarioProblem,
+    alternatives: tuple[ScoredRoadAlternative, ...],
+) -> pd.DataFrame:
+    rows = []
+    for item in alternatives:
+        route = item.route
+        rows.append(
+            {
+                "Alternative": f"{route.returned_order} ({route.alternative_id})",
+                "Road distance": f"{route.distance_km:.2f} km",
+                "Estimated travel time": f"{item.estimated_time_min:.1f} min",
+                f"Estimated fuel ({scenario.fuel_unit})": f"{item.fuel_used:.3f}",
+                "Estimated fuel cost": _format_money(item.fuel_cost),
+                "Estimated operating cost": _format_money(item.operating_cost),
+                "Estimated tailpipe CO2": f"{item.tailpipe_co2_kg:.3f} kg",
+                "Objective score": f"{item.objective_score:.6f}",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _render_comparison(scenario: ScenarioProblem, run: OptimizationRun) -> None:
@@ -737,12 +1118,34 @@ def _render_dynamic_routing(qaoa_config: QAOAConfig) -> None:
     )
     if selected_objective != current["run"].objective_name:
         objective_config = ObjectiveConfig.for_name(selected_objective)
+        previous_run = current["run"]
+        parent_history_id = st.session_state.get("current_history_run_id")
         with st.spinner(f"Re-optimizing the current scenario for {selected_objective}..."):
             current["run"] = optimize_with_objective(
                 scenario,
                 objective_config,
                 qaoa_config,
             )
+        history_run_id = new_run_id()
+        _persist_completed_run(
+            scenario,
+            current["run"],
+            run_id=history_run_id,
+            parent_run_id=parent_history_id if isinstance(parent_history_id, str) else None,
+            operation_type="OBJECTIVE_REOPTIMIZATION",
+            reoptimization={
+                "type": "OBJECTIVE_CHANGE",
+                "before_objective": previous_run.objective_name,
+                "after_objective": current["run"].objective_name,
+                "before_classical_metrics": _impact_record(
+                    calculate_route_impact(scenario, previous_run.classical)
+                ),
+                "after_classical_metrics": _impact_record(
+                    calculate_route_impact(scenario, current["run"].classical)
+                ),
+            },
+        )
+        st.session_state["current_history_run_id"] = history_run_id
         st.session_state["current_run"] = current
         st.session_state["selected_objective"] = selected_objective
         st.session_state["dynamic_comparison"] = None
@@ -824,6 +1227,19 @@ def _render_dynamic_routing(qaoa_config: QAOAConfig) -> None:
             st.session_state["dynamic_comparison"] = comparison
             st.session_state["traffic_comparison"] = None
             if comparison.after_run is not None:
+                parent_history_id = st.session_state.get("current_history_run_id")
+                history_run_id = new_run_id()
+                _persist_completed_run(
+                    comparison.after_scenario,
+                    comparison.after_run,
+                    run_id=history_run_id,
+                    parent_run_id=(
+                        parent_history_id if isinstance(parent_history_id, str) else None
+                    ),
+                    operation_type="TRAFFIC_REOPTIMIZATION",
+                    reoptimization=_traffic_history_event(comparison),
+                )
+                st.session_state["current_history_run_id"] = history_run_id
                 st.session_state["current_run"] = {
                     "scenario": comparison.after_scenario,
                     "run": comparison.after_run,
@@ -831,6 +1247,43 @@ def _render_dynamic_routing(qaoa_config: QAOAConfig) -> None:
                 st.rerun()
             else:
                 st.error(comparison.error or "Re-optimization failed; prior routes remain active.")
+
+
+def _impact_record(impact) -> dict[str, object]:
+    return {
+        "distance_km": impact.distance_km,
+        "travel_time_min": impact.travel_time_min,
+        "cost": impact.cost,
+        "fuel_used": impact.fuel_used,
+        "fuel_unit": impact.fuel_unit,
+        "tailpipe_co2_kg": impact.tailpipe_co2_kg,
+    }
+
+
+def _traffic_history_event(comparison: TrafficReoptimization) -> dict[str, object]:
+    changes: dict[str, object] = {}
+    for name, change in (
+        ("classical", comparison.classical),
+        ("qaoa_aer", comparison.quantum),
+    ):
+        if change is not None:
+            changes[name] = {
+                "before": _impact_record(change.before),
+                "after": _impact_record(change.after),
+                "differences": {
+                    "distance_km": change.distance_change_km,
+                    "travel_time_min": change.travel_time_change_min,
+                    "cost": change.cost_change,
+                    "fuel_used": change.fuel_change,
+                    "tailpipe_co2_kg": change.tailpipe_co2_change_kg,
+                },
+            }
+    return {
+        "type": "SIMULATED_TRAFFIC_REOPTIMIZATION",
+        "before_traffic": comparison.before_scenario.traffic_condition,
+        "after_traffic": comparison.after_scenario.traffic_condition,
+        "solver_comparisons": changes,
+    }
 
 
 def _render_fleet_disruption(qaoa_config: QAOAConfig) -> None:
@@ -926,6 +1379,67 @@ def _render_fleet_disruption(qaoa_config: QAOAConfig) -> None:
                 )
             state["result"] = result
             st.session_state["fleet_disruption_result"] = result
+            if result.after_run is not None:
+                parent_history_id = st.session_state.get("current_history_run_id")
+                history_run_id = new_run_id()
+                _persist_completed_run(
+                    result.after_scenario,
+                    result.after_run,
+                    run_id=history_run_id,
+                    parent_run_id=(
+                        parent_history_id if isinstance(parent_history_id, str) else None
+                    ),
+                    operation_type="FLEET_REOPTIMIZATION",
+                    feasibility_status=(
+                        "VALIDATED" if not result.unassigned_deliveries else "PARTIAL"
+                    ),
+                    reoptimization={
+                        "type": "FLEET_DISRUPTION",
+                        "before_metrics": {
+                            "distance_km": result.before_metrics.total_distance_km,
+                            "travel_time_min": result.before_metrics.total_travel_time_min,
+                            "cost": result.before_metrics.total_cost,
+                            "fuel_used": result.before_metrics.fuel_used,
+                            "tailpipe_co2_kg": result.before_metrics.tailpipe_co2_kg,
+                        },
+                        "after_metrics": (
+                            {
+                                "distance_km": result.after_metrics.total_distance_km,
+                                "travel_time_min": result.after_metrics.total_travel_time_min,
+                                "cost": result.after_metrics.total_cost,
+                                "fuel_used": result.after_metrics.fuel_used,
+                                "tailpipe_co2_kg": result.after_metrics.tailpipe_co2_kg,
+                            }
+                            if result.after_metrics is not None
+                            else None
+                        ),
+                        "unassigned_deliveries": [
+                            {
+                                "delivery_id": item.delivery_id,
+                                "priority": item.priority.value,
+                                "reason": item.reason,
+                            }
+                            for item in result.unassigned_deliveries
+                        ],
+                    },
+                    extra_inputs={
+                        "vehicle_statuses": {
+                            key: value.value for key, value in result.vehicle_statuses.items()
+                        },
+                        "delivery_priorities": {
+                            key: value.value for key, value in result.delivery_priorities.items()
+                        },
+                        "reassignments": [
+                            {
+                                "delivery_id": item.delivery_id,
+                                "from_vehicle": item.from_vehicle,
+                                "to_vehicle": item.to_vehicle,
+                            }
+                            for item in result.reassignments
+                        ],
+                    },
+                )
+                st.session_state["current_history_run_id"] = history_run_id
         except Exception as error:
             state["result"] = None
             st.session_state.pop("fleet_disruption_result", None)
@@ -1010,11 +1524,7 @@ def _render_fleet_disruption_result(result: FleetDisruptionResult) -> None:
         st.error("No after-route result is available; the prior plan remains the only valid plan.")
         return
 
-    before_col, after_col = st.columns(2)
-    with before_col:
-        _render_fleet_metric_group("Before disruption", result.before_metrics)
-    with after_col:
-        _render_fleet_metric_group("After disruption", result.after_metrics)
+    _render_fleet_before_after(result)
 
     if result.reassignments:
         st.markdown("#### Deliveries moved from unavailable vehicles")
@@ -1047,6 +1557,18 @@ def _render_fleet_disruption_result(result: FleetDisruptionResult) -> None:
     _render_comparison(result.optimization_scenario, result.after_run)
     _render_fleet_view(result.optimization_scenario, result.after_run)
     _render_route_map(result.after_scenario, result.after_run, None)
+
+
+def _render_fleet_before_after(result: FleetDisruptionResult) -> None:
+    if result.after_metrics is None:
+        st.error("No after-route metrics are available; the prior plan remains the only valid plan.")
+        return
+
+    before_col, after_col = st.columns(2)
+    with before_col:
+        _render_fleet_metric_group("Before disruption", result.before_metrics)
+    with after_col:
+        _render_fleet_metric_group("After disruption", result.after_metrics)
 
 
 def _render_fleet_metric_group(label: str, metrics) -> None:
@@ -1125,6 +1647,7 @@ def _render_demo_mode() -> None:
                     DEMO_QAOA_CONFIG,
                     progress_callback=report_stage,
                 )
+                _persist_demo_history(st.session_state["hackathon_demo_result"])
                 status.update(
                     label="QuantumRoute Demonstration Complete",
                     state="complete",
@@ -1153,6 +1676,89 @@ def _render_demo_mode() -> None:
     _render_demo_sustainability(demo)
     _render_quantum_execution_comparison(demo)
     _render_demo_summary(demo)
+
+
+def _persist_demo_history(demo: HackathonDemoResult) -> None:
+    baseline_id = new_run_id()
+    st.session_state["demo_history_baseline_run_id"] = baseline_id
+    _persist_completed_run(
+        demo.scenario,
+        demo.baseline_run,
+        run_id=baseline_id,
+        operation_type="DEMO_BASELINE",
+    )
+    for objective_result in demo.objective_results:
+        objective_run = OptimizationRun(
+            classical=objective_result.physical_summary,
+            quantum=None,
+            quantum_result=None,
+            quantum_error="This demo objective comparison used the classical solver only.",
+            objective_delta=None,
+            relative_gap_percent=None,
+            objective_name=objective_result.objective.value,
+            classical_objective_value=objective_result.objective_value,
+        )
+        _persist_completed_run(
+            demo.scenario,
+            objective_run,
+            run_id=new_run_id(),
+            parent_run_id=baseline_id,
+            operation_type="DEMO_OBJECTIVE_COMPARISON",
+        )
+
+    if demo.traffic_result.after_run is None:
+        st.warning("The demo traffic stage has no completed result to save to history.")
+        return
+    traffic_id = new_run_id()
+    _persist_completed_run(
+        demo.traffic_result.after_scenario,
+        demo.traffic_result.after_run,
+        run_id=traffic_id,
+        parent_run_id=baseline_id,
+        operation_type="DEMO_TRAFFIC_REOPTIMIZATION",
+        reoptimization=_traffic_history_event(demo.traffic_result),
+    )
+    fleet_result = demo.fleet_result
+    if fleet_result.after_run is not None:
+        _persist_completed_run(
+            fleet_result.after_scenario,
+            fleet_result.after_run,
+            run_id=new_run_id(),
+            parent_run_id=traffic_id,
+            operation_type="DEMO_FLEET_REOPTIMIZATION",
+            feasibility_status=(
+                "VALIDATED" if not fleet_result.unassigned_deliveries else "PARTIAL"
+            ),
+            reoptimization={
+                "type": "DEMO_FLEET_DISRUPTION",
+                "before_metrics": {
+                    "distance_km": fleet_result.before_metrics.total_distance_km,
+                    "travel_time_min": fleet_result.before_metrics.total_travel_time_min,
+                    "cost": fleet_result.before_metrics.total_cost,
+                    "fuel_used": fleet_result.before_metrics.fuel_used,
+                    "tailpipe_co2_kg": fleet_result.before_metrics.tailpipe_co2_kg,
+                },
+                "after_metrics": (
+                    {
+                        "distance_km": fleet_result.after_metrics.total_distance_km,
+                        "travel_time_min": fleet_result.after_metrics.total_travel_time_min,
+                        "cost": fleet_result.after_metrics.total_cost,
+                        "fuel_used": fleet_result.after_metrics.fuel_used,
+                        "tailpipe_co2_kg": fleet_result.after_metrics.tailpipe_co2_kg,
+                    }
+                    if fleet_result.after_metrics is not None
+                    else None
+                ),
+            },
+            extra_inputs={
+                "vehicle_statuses": {
+                    key: value.value for key, value in fleet_result.vehicle_statuses.items()
+                },
+                "delivery_priorities": {
+                    key: value.value for key, value in fleet_result.delivery_priorities.items()
+                },
+            },
+        )
 
 
 def _render_quantum_execution_comparison(
@@ -1203,7 +1809,10 @@ def _render_quantum_execution_comparison(
     if not counts.empty:
         with st.expander("Hardware measurement distribution", expanded=False):
             st.dataframe(counts, hide_index=True, width="stretch")
-            st.caption(f"Most frequent bitstring: {job_state.most_frequent_bitstring}")
+            st.caption(
+                f"Most frequent bitstring: {job_state.most_frequent_bitstring}; "
+                f"selected feasible candidate: {job_state.selected_solution_bitstring or 'none'}"
+            )
 
     if job_state.route_valid is not True:
         st.error("Hardware result did not produce a valid route.")
@@ -1788,17 +2397,47 @@ def _render_ibm_quantum_hardware() -> None:
 
     if job_state.job_id:
         _render_ibm_job_state(job_state)
+        evidence_error = st.session_state.get("ibm_hardware_evidence_error")
+        if evidence_error:
+            st.error(evidence_error)
+        evidence_paths = st.session_state.get("ibm_hardware_evidence_paths")
+        if evidence_paths:
+            st.success(
+                "Completed hardware evidence saved: "
+                f"`{evidence_paths[0]}` and `{evidence_paths[1]}`."
+            )
         if st.button("Refresh Job Status", key="refresh_ibm_hardware_job"):
             try:
                 connection = connect_ibm_quantum()
-                execution_package = st.session_state.get("ibm_hardware_dry_run").execution_package
                 job_state = refresh_hardware_job_status(
                     connection,
                     job_state,
-                    execution_package,
+                    job_state.execution_package,
                 )
             except Exception:
                 job_state.message = "Could not refresh the existing IBM job. No new job was submitted."
+            if (
+                job_state.is_real_hardware_execution
+                and job_state.measurement_result_received
+                and job_state.status.upper() == "DONE"
+            ):
+                try:
+                    evidence_paths = write_hardware_evidence(
+                        job_state,
+                        job_state.execution_package.scenario,
+                    )
+                    _persist_hardware_operation(
+                        job_state,
+                        tuple(evidence_paths),
+                    )
+                    st.session_state["ibm_hardware_evidence_paths"] = tuple(
+                        path.name for path in evidence_paths
+                    )
+                    st.session_state.pop("ibm_hardware_evidence_error", None)
+                except (HardwareEvidenceError, OSError) as error:
+                    st.session_state["ibm_hardware_evidence_error"] = (
+                        f"Completed job evidence could not be saved: {error}"
+                    )
             st.session_state["ibm_hardware_job_state"] = job_state
             st.rerun()
         if job_state.measurement_result_received:
@@ -1813,6 +2452,101 @@ def _render_ibm_quantum_hardware() -> None:
         st.info("No job submitted yet.")
     else:
         st.warning(job_state.message)
+
+
+def _persist_hardware_operation(
+    job_state: HardwareJobState,
+    evidence_paths: tuple[Path, ...],
+) -> None:
+    demo: HackathonDemoResult | None = st.session_state.get("hackathon_demo_result")
+    parent_run_id = st.session_state.get("demo_history_baseline_run_id")
+    package_scenario = getattr(job_state.execution_package, "scenario", None)
+    if not (
+        demo is not None
+        and isinstance(parent_run_id, str)
+        and isinstance(package_scenario, ScenarioProblem)
+        and package_scenario == demo.scenario
+        and job_state.is_real_hardware_execution
+        and job_state.submission_attempted
+        and job_state.measurement_result_received
+        and job_state.status.upper() == "DONE"
+        and job_state.job_id
+        and job_state.run_id
+        and job_state.actual_backend_name
+        and job_state.shots is not None
+        and evidence_paths
+    ):
+        st.warning(
+            "Verified hardware evidence was saved, but it could not be linked to an "
+            "exact matching SQLite optimization record."
+        )
+        return
+
+    try:
+        history = SQLiteOperationHistory()
+        parent = history.get_operation(parent_run_id)
+        if parent is None:
+            raise ValueError("The matching demo baseline is not present in operation history.")
+        existing = history.get_operation(job_state.run_id)
+        evidence_reference = f"artifacts/ibm_hardware/{evidence_paths[0].name}"
+        if existing is not None:
+            existing_hardware = existing["outputs"].get("ibm_hardware", {})
+            if (
+                isinstance(existing_hardware, dict)
+                and existing_hardware.get("job_id") == job_state.job_id
+                and existing_hardware.get("verified_evidence_reference")
+                == evidence_reference
+            ):
+                return
+            raise ValueError(
+                "The hardware run ID is already linked to different operation data."
+            )
+        record = build_operation_record(
+            package_scenario,
+            demo.baseline_run,
+            run_id=job_state.run_id,
+            parent_run_id=parent_run_id,
+            operation_type="REAL_IBM_HARDWARE",
+            feasibility_status="VALIDATED" if job_state.route_valid else "FAILED",
+            failure_details=None if job_state.route_valid else job_state.route_message,
+        )
+        if parent["inputs"] != record["inputs"]:
+            raise ValueError(
+                "The hardware scenario does not match the recorded optimization inputs."
+            )
+        outputs = record["outputs"]
+        if not isinstance(outputs, dict):
+            raise ValueError("The operation history output snapshot is invalid.")
+        outputs["ibm_hardware"] = {
+            "status": "VERIFIED_EVIDENCE",
+            "job_id": job_state.job_id,
+            "backend": job_state.actual_backend_name,
+            "shots": job_state.shots,
+            "shots_returned": job_state.shots_returned,
+            "job_status": job_state.status,
+            "submitted_at": job_state.submitted_at,
+            "completed_at": job_state.completed_at,
+            "route_valid": job_state.route_valid,
+            "evidence_status": "VERIFIED",
+            "verified_evidence_reference": evidence_reference,
+            "manifest_reference": job_state.manifest_path,
+            "manifest_sha256": job_state.manifest_sha256,
+        }
+        solvers = outputs.get("solver_results")
+        if isinstance(solvers, dict):
+            solvers["ibm_hardware"] = {
+                "method": "REAL_IBM_QUANTUM_HARDWARE",
+                "status": "VALIDATED" if job_state.route_valid else "INVALID_ROUTE",
+                "selected_bitstring": job_state.selected_solution_bitstring,
+                "route_message": job_state.route_message,
+                "evidence_reference": evidence_reference,
+            }
+        history.save_completed_operation(record)
+    except Exception as error:
+        st.warning(
+            "Verified hardware evidence was saved, but its history link could not be "
+            f"saved: {type(error).__name__}: {error}"
+        )
 
 
 def _render_ibm_pre_submission_confirmation(dry_run: HardwareDryRunResult) -> None:
@@ -1842,6 +2576,10 @@ def _render_ibm_job_state(job_state: HardwareJobState) -> None:
     st.write(f"Shots: {job_state.shots}")
     if job_state.submitted_at:
         st.caption(f"Submitted: {job_state.submitted_at}")
+    if job_state.completed_at:
+        st.caption(f"Completed: {job_state.completed_at}")
+    if job_state.error_info:
+        st.error(job_state.error_info)
     st.caption(job_state.message)
 
 
@@ -1856,6 +2594,11 @@ def _render_ibm_hardware_result(job_state: HardwareJobState) -> None:
     if not counts.empty:
         st.dataframe(counts, hide_index=True, width="stretch")
     st.write(f"Most frequent measured bitstring: {job_state.most_frequent_bitstring}")
+    if job_state.selected_solution_bitstring:
+        st.write(
+            "Selected feasible candidate (lowest observed QUBO energy): "
+            f"{job_state.selected_solution_bitstring}"
+        )
     if job_state.route_valid is False:
         st.error("Hardware result did not produce a valid route.")
         st.caption(job_state.route_message or "Raw measurements are retained above; no replacement route was used.")

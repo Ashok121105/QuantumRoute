@@ -4,7 +4,7 @@ No IBM service or execution API is imported or called from this module.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from math import isclose, isfinite
 from numbers import Real
@@ -13,7 +13,7 @@ from typing import Any
 from ibm_qaoa_adapter import (
     QAOAExecutionPackage,
     RouteVariableBinding,
-    build_demo_route_qubo,
+    build_demo_route_problem,
     prepare_route_qaoa_execution_package,
     qaoa_parameter_alias,
     qaoa_parameter_names,
@@ -25,6 +25,7 @@ from quantum_route_optimisation.qaoa import (
     run_qaoa_optimizer,
 )
 from quantum_route_optimisation.qubo import RouteQubo
+from route_dashboard.scenario import ScenarioProblem
 
 
 class QAOAParameterProvenance(str, Enum):
@@ -67,7 +68,7 @@ def optimize_demo_qaoa_parameters(
     config: QAOAConfig = DEFAULT_DEMO_QAOA_CONFIG,
 ) -> QAOAParameterResult:
     """Run the existing seeded local Aer QAOA on the Demo Mode's exact route QUBO."""
-    formulation = build_demo_route_qubo()
+    scenario, objective_scenario, formulation = build_demo_route_problem()
     try:
         optimizer_run = run_qaoa_optimizer(formulation, config)
     except Exception:
@@ -76,13 +77,22 @@ def optimize_demo_qaoa_parameters(
             config.reps,
             "The local Aer optimizer did not return optimized QAOA parameters.",
         )
-    return extract_local_qaoa_parameters(optimizer_run, formulation, config.reps)
+    return extract_local_qaoa_parameters(
+        optimizer_run,
+        formulation,
+        config.reps,
+        scenario=scenario,
+        objective_scenario=objective_scenario,
+    )
 
 
 def extract_local_qaoa_parameters(
     optimizer_run: LocalQAOAOptimizerRun,
     formulation: RouteQubo,
     reps: int,
+    *,
+    scenario: ScenarioProblem | None = None,
+    objective_scenario: ScenarioProblem | None = None,
 ) -> QAOAParameterResult:
     """Extract public optimizer output and bind it only to the same RouteQubo."""
     problem = _problem_metadata(formulation)
@@ -186,11 +196,42 @@ def extract_local_qaoa_parameters(
         getattr(solver_result, "optimal_value", None)
     )
     bindings = dict(zip(parameter_names, parameter_values))
+    optimizer_config = getattr(optimizer_run, "config", None)
+    initial_point = getattr(optimizer_run, "initial_point", None)
+    optimization_history = getattr(optimizer_run, "optimization_history", None)
+    optimizer_metadata: dict[str, object] = {
+        "method": "QAOA with COBYLA optimizer using Qiskit Aer SamplerV2",
+        "configuration": (
+            asdict(optimizer_config)
+            if isinstance(optimizer_config, QAOAConfig)
+            else None
+        ),
+        "initial_point": (
+            [float(value) for value in initial_point]
+            if initial_point is not None
+            else None
+        ),
+        "history": (
+            [
+                {
+                    "evaluation": evaluation,
+                    "parameters": [float(value) for value in values],
+                    "objective": float(objective),
+                }
+                for evaluation, values, objective in optimization_history
+            ]
+            if optimization_history is not None
+            else None
+        ),
+    }
     try:
         execution_package = prepare_route_qaoa_execution_package(
             formulation,
             bindings,
             reps,
+            scenario=scenario,
+            objective_scenario=objective_scenario,
+            optimizer_metadata=optimizer_metadata,
         )
     except Exception:
         return QAOAParameterResult(

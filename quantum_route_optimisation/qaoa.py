@@ -72,6 +72,9 @@ class LocalQAOAOptimizerRun:
 
     qaoa: QAOA = field(repr=False, compare=False)
     optimizer_result: Any = field(repr=False, compare=False)
+    config: QAOAConfig
+    initial_point: tuple[float, ...]
+    optimization_history: tuple[tuple[int, tuple[float, ...], float], ...]
 
 
 def decode_route_selection(
@@ -152,15 +155,39 @@ def run_qaoa_optimizer(
         pi,
         2 * config.reps,
     )
+    optimization_history: list[tuple[int, tuple[float, ...], float]] = []
+
+    def capture_evaluation(
+        evaluation_count: int,
+        parameters: np.ndarray,
+        mean: float,
+        metadata: dict[str, Any],
+    ) -> None:
+        del metadata
+        optimization_history.append(
+            (
+                evaluation_count,
+                tuple(float(value) for value in parameters),
+                float(mean),
+            )
+        )
+
     qaoa = QAOA(
         sampler=sampler,
         optimizer=COBYLA(maxiter=config.maxiter),
         reps=config.reps,
         initial_point=initial_point,
+        callback=capture_evaluation,
         transpiler=pass_manager,
     )
     result = MinimumEigenOptimizer(qaoa).solve(formulation.problem)
-    return LocalQAOAOptimizerRun(qaoa=qaoa, optimizer_result=result)
+    return LocalQAOAOptimizerRun(
+        qaoa=qaoa,
+        optimizer_result=result,
+        config=config,
+        initial_point=tuple(float(value) for value in initial_point),
+        optimization_history=tuple(optimization_history),
+    )
 
 
 def solve_qaoa(
@@ -169,10 +196,16 @@ def solve_qaoa(
     travel: TravelData,
     cost_weights: RouteCostWeights,
     config: QAOAConfig = QAOAConfig(),
+    *,
+    feasible_routes: Sequence[FeasibleRoute] | None = None,
 ) -> QuantumOptimizationResult:
     """Generate Qiskit QAOA samples on Aer, then return the best valid route set."""
-    feasible_routes = generate_feasible_routes(vehicles, deliveries, travel, cost_weights)
-    formulation = build_route_qubo(feasible_routes, deliveries)
+    candidates = (
+        tuple(feasible_routes)
+        if feasible_routes is not None
+        else generate_feasible_routes(vehicles, deliveries, travel, cost_weights)
+    )
+    formulation = build_route_qubo(candidates, deliveries)
     result = run_qaoa_optimizer(formulation, config).optimizer_result
 
     valid_samples: list[tuple[DecodedRouteSelection, float, float]] = []

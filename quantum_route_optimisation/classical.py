@@ -54,6 +54,8 @@ def optimize_classically(
     deliveries: Sequence[Delivery],
     travel: TravelData,
     cost_weights: RouteCostWeights,
+    *,
+    feasible_routes: Sequence[FeasibleRoute] | None = None,
 ) -> OptimizationResult:
     """Minimize route cost with exact set partitioning over feasible routes."""
     _validate_unique_ids(vehicles, deliveries)
@@ -62,11 +64,15 @@ def optimize_classically(
     if not vehicles:
         raise NoFeasibleSolutionError("at least one vehicle is required")
 
-    feasible_routes = generate_feasible_routes(vehicles, deliveries, travel, cost_weights)
+    candidates = (
+        tuple(feasible_routes)
+        if feasible_routes is not None
+        else generate_feasible_routes(vehicles, deliveries, travel, cost_weights)
+    )
     delivery_ids = frozenset(delivery.delivery_id for delivery in deliveries)
     routes_by_delivery = {
         delivery_id: tuple(
-            route for route in feasible_routes if delivery_id in route.plan.delivery_ids
+            route for route in candidates if delivery_id in route.plan.delivery_ids
         )
         for delivery_id in delivery_ids
     }

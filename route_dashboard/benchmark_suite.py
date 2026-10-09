@@ -146,6 +146,7 @@ def _run_case(case: BenchmarkCase, config: QAOAConfig) -> BenchmarkResult:
         problem.deliveries,
         problem.travel,
         problem.cost_weights,
+        feasible_routes=route_options,
     )
     classical_routes = validate_route_set(classical.routes, problem)
     classical_runtime = perf_counter() - classical_start
@@ -187,6 +188,7 @@ def _run_case(case: BenchmarkCase, config: QAOAConfig) -> BenchmarkResult:
             problem.travel,
             problem.cost_weights,
             quantum_config,
+            feasible_routes=route_options,
         )
         qaoa_routes = validate_route_set(quantum.routes, problem)
         qaoa_runtime = perf_counter() - qaoa_start

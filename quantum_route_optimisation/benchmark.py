@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from .classical import OptimizationResult, optimize_classically
-from .models import Delivery, RouteCostWeights, TravelData, Vehicle
+from .models import Delivery, FeasibleRoute, RouteCostWeights, TravelData, Vehicle
 from .qaoa import QAOAConfig, QuantumOptimizationResult, solve_qaoa
 
 
@@ -26,10 +26,25 @@ def compare_classical_and_qaoa(
     travel: TravelData,
     cost_weights: RouteCostWeights,
     qaoa_config: QAOAConfig = QAOAConfig(),
+    *,
+    feasible_routes: Sequence[FeasibleRoute] | None = None,
 ) -> OptimizationComparison:
     """Run both optimizers on identical inputs and compare the route-cost objective."""
-    classical = optimize_classically(vehicles, deliveries, travel, cost_weights)
-    quantum = solve_qaoa(vehicles, deliveries, travel, cost_weights, qaoa_config)
+    classical = optimize_classically(
+        vehicles,
+        deliveries,
+        travel,
+        cost_weights,
+        feasible_routes=feasible_routes,
+    )
+    quantum = solve_qaoa(
+        vehicles,
+        deliveries,
+        travel,
+        cost_weights,
+        qaoa_config,
+        feasible_routes=feasible_routes,
+    )
     delta = quantum.objective_value - classical.total_cost
     relative_gap = (
         None

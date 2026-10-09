@@ -1,8 +1,11 @@
 """Local-coordinate and optional OSRM travel-time matrix providers."""
 
 import json
+from dataclasses import dataclass
 from functools import lru_cache
+from hashlib import sha256
 from math import asin, cos, isfinite, radians, sin, sqrt
+from time import monotonic
 from typing import Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -21,6 +24,17 @@ TRAFFIC_FACTORS = {
 }
 LOCAL_ROAD_FACTOR = 1.25
 LOCAL_SPEED_KMPH = 32.0
+ROUTING_CACHE_TTL_SECONDS = 300
+MAX_ROAD_ALTERNATIVES = 3
+
+
+@dataclass(frozen=True)
+class OSRMRouteAlternative:
+    alternative_id: str
+    returned_order: int
+    geometry: tuple[tuple[float, float], ...]
+    distance_km: float
+    duration_min: float
 
 
 def build_travel_data(
@@ -46,7 +60,16 @@ def build_travel_data(
                 ),
                 "OSRM public table service",
             )
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as error:
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            OverflowError,
+        ) as error:
             local = _build_local_travel_data(coordinates, traffic_condition)
             return local, f"Local estimate (OSRM unavailable: {error})"
 
@@ -85,6 +108,7 @@ def _fetch_osrm_table(
     distances, durations, error = _fetch_osrm_table_cached(
         location_points,
         timeout_seconds,
+        int(monotonic() // ROUTING_CACHE_TTL_SECONDS),
     )
     if error:
         raise OSError(error)
@@ -93,12 +117,15 @@ def _fetch_osrm_table(
 
 @lru_cache(maxsize=64)
 def _fetch_osrm_table_cached(
-    location_points: tuple[tuple[str, float, float], ...], timeout_seconds: float
+    location_points: tuple[tuple[str, float, float], ...],
+    timeout_seconds: float,
+    cache_bucket: int,
 ) -> tuple[
     tuple[tuple[float | None, ...], ...],
     tuple[tuple[float | None, ...], ...],
     str | None,
 ]:
+    del cache_bucket
     coordinate_path = ";".join(
         f"{longitude},{latitude}" for _, latitude, longitude in location_points
     )
@@ -110,12 +137,23 @@ def _fetch_osrm_table_cached(
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("OSRM returned a malformed table response")
         if payload.get("code") != "Ok":
             raise ValueError(f"OSRM returned {payload.get('code', 'an unknown error')}")
         distances = tuple(tuple(row) for row in payload["distances"])
         durations = tuple(tuple(row) for row in payload["durations"])
         return distances, durations, None
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as error:
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        OverflowError,
+    ) as error:
         return (), (), str(error)
 
 
@@ -127,14 +165,127 @@ def get_osrm_route_geometry(
         (float(latitude), float(longitude))
         for latitude, longitude in route_coordinates
     )
-    geometry, error = _fetch_osrm_route_geometry_cached(coordinates, timeout_seconds)
+    geometry, error = _fetch_osrm_route_geometry_cached(
+        coordinates,
+        timeout_seconds,
+        int(monotonic() // ROUTING_CACHE_TTL_SECONDS),
+    )
     return (geometry or None), error
+
+
+def get_osrm_route_alternatives(
+    origin: tuple[float, float],
+    destination: tuple[float, float],
+    timeout_seconds: float = 4.0,
+) -> tuple[tuple[OSRMRouteAlternative, ...], str | None]:
+    """Return at most three distinct OSRM road routes for one selected leg."""
+    _validate_coordinates({"origin": origin, "destination": destination})
+    if origin == destination:
+        raise ValueError("origin and destination must be different")
+    points = (
+        (float(origin[0]), float(origin[1])),
+        (float(destination[0]), float(destination[1])),
+    )
+    cache_bucket = int(monotonic() // ROUTING_CACHE_TTL_SECONDS)
+    return _fetch_osrm_route_alternatives_cached(
+        points,
+        timeout_seconds,
+        cache_bucket,
+    )
+
+
+@lru_cache(maxsize=64)
+def _fetch_osrm_route_alternatives_cached(
+    route_coordinates: tuple[tuple[float, float], ...],
+    timeout_seconds: float,
+    cache_bucket: int,
+) -> tuple[tuple[OSRMRouteAlternative, ...], str | None]:
+    del cache_bucket
+    coordinate_path = ";".join(
+        f"{longitude},{latitude}" for latitude, longitude in route_coordinates
+    )
+    request = Request(
+        f"https://router.project-osrm.org/route/v1/driving/{coordinate_path}"
+        "?overview=full&geometries=geojson&steps=false&alternatives=2",
+        headers={"User-Agent": "QuantumRouteDashboard/1.0"},
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("code") != "Ok":
+            code = payload.get("code", "malformed response") if isinstance(payload, dict) else "malformed response"
+            raise ValueError(f"OSRM returned {code}")
+        raw_routes = payload.get("routes")
+        if not isinstance(raw_routes, list):
+            raise ValueError("OSRM returned a malformed routes list")
+
+        alternatives: list[OSRMRouteAlternative] = []
+        seen_geometries: set[tuple[tuple[float, float], ...]] = set()
+        for returned_order, route in enumerate(raw_routes[:MAX_ROAD_ALTERNATIVES], start=1):
+            if not isinstance(route, dict) or not isinstance(route.get("geometry"), dict):
+                raise ValueError("OSRM returned a malformed route")
+            raw_coordinates = route["geometry"].get("coordinates")
+            if not isinstance(raw_coordinates, list):
+                raise ValueError("OSRM returned malformed route geometry")
+            geometry = tuple(
+                (float(point[1]), float(point[0]))
+                for point in raw_coordinates
+                if isinstance(point, (list, tuple)) and len(point) == 2
+            )
+            if len(geometry) != len(raw_coordinates) or len(geometry) < 2 or any(
+                not isfinite(latitude)
+                or not isfinite(longitude)
+                or not -90 <= latitude <= 90
+                or not -180 <= longitude <= 180
+                for latitude, longitude in geometry
+            ):
+                raise ValueError("OSRM returned invalid route geometry")
+            if geometry in seen_geometries:
+                continue
+            distance_km = float(route["distance"]) / 1000.0
+            duration_min = float(route["duration"]) / 60.0
+            if (
+                not isfinite(distance_km)
+                or distance_km < 0
+                or not isfinite(duration_min)
+                or duration_min < 0
+            ):
+                raise ValueError("OSRM returned invalid route metrics")
+            stable_id = "road-" + sha256(
+                json.dumps(geometry, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:12]
+            alternatives.append(
+                OSRMRouteAlternative(
+                    stable_id,
+                    returned_order,
+                    geometry,
+                    distance_km,
+                    duration_min,
+                )
+            )
+            seen_geometries.add(geometry)
+        return tuple(alternatives), None
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        OverflowError,
+        IndexError,
+    ) as error:
+        return (), str(error)
 
 
 @lru_cache(maxsize=128)
 def _fetch_osrm_route_geometry_cached(
-    route_coordinates: tuple[tuple[float, float], ...], timeout_seconds: float
+    route_coordinates: tuple[tuple[float, float], ...],
+    timeout_seconds: float,
+    cache_bucket: int,
 ) -> tuple[tuple[tuple[float, float], ...], str | None]:
+    del cache_bucket
     coordinate_path = ";".join(
         f"{longitude},{latitude}" for latitude, longitude in route_coordinates
     )
@@ -146,6 +297,8 @@ def _fetch_osrm_route_geometry_cached(
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("OSRM returned a malformed route geometry response")
         if payload.get("code") != "Ok" or not payload.get("routes"):
             raise ValueError(f"OSRM route geometry unavailable: {payload.get('code', 'no route')}")
         raw_coordinates = payload["routes"][0]["geometry"]["coordinates"]
@@ -162,7 +315,17 @@ def _fetch_osrm_route_geometry_cached(
         ):
             raise ValueError("OSRM returned invalid route geometry")
         return geometry, None
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError, IndexError) as error:
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        OverflowError,
+        IndexError,
+    ) as error:
         return (), str(error)
 
 

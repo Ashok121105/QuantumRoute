@@ -1,4 +1,7 @@
 from dataclasses import replace
+import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -33,6 +36,20 @@ class IBMHardwareExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         ibm_execution._active_job_id = None
         ibm_execution._submission_outcome_unknown = False
+        manifest_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(manifest_directory.cleanup)
+        manifest_patch = patch(
+            "ibm_hardware_provenance.MANIFEST_DIRECTORY",
+            Path(manifest_directory.name),
+        )
+        manifest_patch.start()
+        self.addCleanup(manifest_patch.stop)
+        progress_patch = patch(
+            "ibm_hardware_provenance.PROGRESS_DIRECTORY",
+            Path(manifest_directory.name) / "progress",
+        )
+        progress_patch.start()
+        self.addCleanup(progress_patch.stop)
         self.backend = SimpleNamespace(
             name="ibm_mock_backend",
             num_qubits=127,
@@ -56,11 +73,7 @@ class IBMHardwareExecutionTests(unittest.TestCase):
         )
 
     def _dry_run(self, *, shots: int = 256) -> HardwareDryRunResult:
-        package = SimpleNamespace(
-            parameter_source="local_aer_optimized",
-            problem=SimpleNamespace(route_variable_count=4),
-            circuit=QuantumCircuit(5, 4),
-        )
+        package = self.parameter_result.execution_package
         return HardwareDryRunResult(
             ready=True,
             status=HardwareDryRunStatus.READY_FOR_CONFIRMATION,
@@ -73,7 +86,7 @@ class IBMHardwareExecutionTests(unittest.TestCase):
                 pending_jobs=0,
                 simulator=False,
             ),
-            circuit_qubits=5,
+            circuit_qubits=package.circuit.num_qubits,
             shots=shots,
             transpiled_circuit=package.circuit,
             execution_package=package,
@@ -105,7 +118,22 @@ class IBMHardwareExecutionTests(unittest.TestCase):
         job = Mock()
         job.job_id.return_value = "mock-job-123"
         sampler = Mock()
-        sampler.run.return_value = job
+        def check_manifest_precedes_submission(*args, **kwargs):
+            manifests = list(Path(self._manifest_directory()).glob("*.json"))
+            self.assertEqual(len(manifests), 1)
+            saved_manifest = manifests[0].read_text(encoding="utf-8")
+            self.assertIn("PRE_SUBMISSION_CONFIRMED", saved_manifest)
+            progress_records = list(
+                (Path(self._manifest_directory()) / "progress").glob("*.json")
+            )
+            self.assertEqual(len(progress_records), 1)
+            progress = json.loads(progress_records[0].read_text(encoding="utf-8"))
+            self.assertEqual(progress["record_type"], "IBM_HARDWARE_EXECUTION_PROGRESS_NOT_VERIFIED")
+            self.assertIsNone(progress["job_id"])
+            sampler.run.return_value = job
+            return job
+
+        sampler.run.side_effect = check_manifest_precedes_submission
         runtime = self._runtime_mock(sampler)
         state = HardwareJobState()
         with patch("ibm_execution.importlib.import_module", return_value=runtime):
@@ -126,9 +154,42 @@ class IBMHardwareExecutionTests(unittest.TestCase):
         self.assertEqual(submitted.status, "SUBMITTED")
         self.assertEqual(submitted.backend_name, "ibm_mock_backend")
         self.assertEqual(submitted.shots, 256)
+        self.assertIsNotNone(submitted.run_id)
+        self.assertTrue(Path(submitted.manifest_path).exists())
+        self.assertTrue(Path(submitted.progress_record_path).exists())
+        saved_progress = json.loads(
+            Path(submitted.progress_record_path).read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved_progress["job_id"], "mock-job-123")
+        self.assertEqual(saved_progress["status"], "SUBMITTED")
+        self.assertTrue(submitted.execution_manifest["user_confirmation"]["confirmed"])
         self.assertIs(duplicate, state)
         sampler.run.assert_called_once_with([self._dry_run().transpiled_circuit], shots=256)
         self.assertEqual(ibm_execution._active_job_id, "mock-job-123")
+
+    def _manifest_directory(self) -> str:
+        from ibm_hardware_provenance import MANIFEST_DIRECTORY
+
+        return str(MANIFEST_DIRECTORY)
+
+    def test_missing_execution_provenance_prevents_submission(self) -> None:
+        package = replace(self.parameter_result.execution_package, scenario=None)
+        dry_run = replace(self._dry_run(), execution_package=package)
+        sampler = Mock()
+        with patch(
+            "ibm_execution.importlib.import_module",
+            return_value=self._runtime_mock(sampler),
+        ):
+            state = submit_confirmed_hardware_job(
+                self.connection,
+                dry_run,
+                confirmed=True,
+            )
+
+        self.assertEqual(state.status, "PROVENANCE_FAILED")
+        self.assertFalse(state.submission_attempted)
+        self.assertIsNone(state.run_id)
+        sampler.run.assert_not_called()
 
     def test_duplicate_execution_is_blocked_while_a_job_is_active(self) -> None:
         ibm_execution._active_job_id = "already-running"
@@ -198,22 +259,86 @@ class IBMHardwareExecutionTests(unittest.TestCase):
     def test_refresh_captures_counts_from_the_existing_completed_job(self) -> None:
         job = Mock()
         job.status.return_value = "DONE"
+        from qiskit.primitives.containers import BitArray
+
         job.result.return_value = [
-            SimpleNamespace(data=SimpleNamespace(meas=SimpleNamespace(get_counts=Mock(return_value={"1010": 10}))))
+            SimpleNamespace(data={"meas": BitArray.from_samples(["1010"] * 10, num_bits=4)})
         ]
+        job.metrics.return_value = {
+            "timestamps": {"finished": "2026-10-09T12:00:00Z"}
+        }
+        job.backend.return_value = self.backend
         self.service.job.return_value = job
         package = prepare_demo_qaoa_execution_package(
             {"beta_0": 0.1, "gamma_0": 0.2}
         )
-        state = HardwareJobState(job_id="completed-job", backend_name="ibm_mock_backend")
+        state = HardwareJobState(
+            job_id="completed-job",
+            backend_name="ibm_mock_backend",
+            submitted_circuit=package.circuit,
+            run_id="progress-run",
+            manifest_path="pre-submission-manifest.json",
+            manifest_sha256="manifest-hash",
+            execution_manifest={},
+        )
 
         refreshed = refresh_hardware_job_status(self.connection, state, package)
 
         self.assertEqual(refreshed.raw_counts, (("1010", 10),))
         self.assertEqual(refreshed.most_frequent_bitstring, "1010")
         self.assertTrue(refreshed.route_valid)
+        self.assertEqual(refreshed.shots_returned, 10)
+        self.assertIn("meas", refreshed.result_register_counts)
+        self.assertEqual(refreshed.actual_backend_name, "ibm_mock_backend")
+        self.assertFalse(refreshed.actual_backend_is_simulator)
+        self.assertIsNotNone(refreshed.qubo_objective_value)
+        progress = json.loads(
+            Path(refreshed.progress_record_path).read_text(encoding="utf-8")
+        )
+        self.assertEqual(progress["job_id"], "completed-job")
+        self.assertEqual(progress["returned_shots"], 10)
+        self.assertEqual(progress["measurement_counts"], {"1010": 10})
+        self.assertEqual(
+            progress["qubo_objective_value"],
+            refreshed.qubo_objective_value,
+        )
+        self.assertTrue(progress["route_validation"]["passed"])
         self.service.job.assert_called_once_with("completed-job")
         self.service.backend.assert_not_called()
+
+    def test_refresh_retries_missing_actual_backend_metadata_without_refetching_result(self) -> None:
+        job = Mock()
+        job.status.return_value = "DONE"
+        from qiskit.primitives.containers import BitArray
+
+        job.result.return_value = [
+            SimpleNamespace(data={"meas": BitArray.from_samples(["1010"], num_bits=4)})
+        ]
+        job.metrics.return_value = {
+            "timestamps": {"finished": "2026-10-09T12:00:00Z"}
+        }
+        job.backend.side_effect = [
+            RuntimeError("synthetic metadata failure"),
+            self.backend,
+        ]
+        self.service.job.return_value = job
+        package = prepare_demo_qaoa_execution_package(
+            {"beta_0": 0.1, "gamma_0": 0.2}
+        )
+        state = HardwareJobState(
+            job_id="completed-job",
+            backend_name="ibm_mock_backend",
+            submitted_circuit=package.circuit,
+        )
+
+        first = refresh_hardware_job_status(self.connection, state, package)
+        second = refresh_hardware_job_status(self.connection, first, package)
+
+        self.assertTrue(second.measurement_result_received)
+        self.assertEqual(second.actual_backend_name, "ibm_mock_backend")
+        self.assertFalse(second.actual_backend_is_simulator)
+        job.result.assert_called_once()
+        self.assertEqual(job.backend.call_count, 2)
 
     def test_shot_limit_is_enforced(self) -> None:
         result = dry_run_hardware_execution(
@@ -335,20 +460,54 @@ class IBMHardwareExecutionTests(unittest.TestCase):
         self.assertIs(result.execution_package, self.parameter_result.execution_package)
         base_dry_run.assert_called_once()
 
-    def test_hardware_decode_uses_adapter_mapping_and_rejects_invalid_route(self) -> None:
+    def test_hardware_decode_selects_best_feasible_observed_candidate(self) -> None:
         package = prepare_demo_qaoa_execution_package(
             {"beta_0": 0.1, "gamma_0": 0.2}
         )
         valid = decode_hardware_counts({"1010": 11, "0000": 3}, package)
-        invalid = decode_hardware_counts({"0000": 13, "1010": 1}, package)
+        less_frequent_valid = decode_hardware_counts(
+            {"0000": 13, "1010": 1},
+            package,
+        )
 
         self.assertTrue(valid.valid_route, valid.message)
         self.assertEqual(valid.most_frequent_bitstring, "1010")
+        self.assertEqual(valid.selected_solution_bitstring, "1010")
         self.assertEqual(len(valid.routes), 2)
-        self.assertFalse(invalid.valid_route)
-        self.assertEqual(invalid.raw_counts, (("0000", 13), ("1010", 1)))
-        self.assertIn("Hardware result did not produce a valid route", invalid.message)
-        self.assertEqual(invalid.routes, ())
+        self.assertTrue(less_frequent_valid.valid_route, less_frequent_valid.message)
+        self.assertEqual(less_frequent_valid.most_frequent_bitstring, "0000")
+        self.assertEqual(less_frequent_valid.selected_solution_bitstring, "1010")
+        self.assertEqual(less_frequent_valid.raw_counts, (("0000", 13), ("1010", 1)))
+        self.assertEqual(len(less_frequent_valid.routes), 2)
+
+    def test_hardware_decode_uses_recorded_non_identity_measurement_mapping(self) -> None:
+        package = prepare_demo_qaoa_execution_package(
+            {"beta_0": 0.1, "gamma_0": 0.2}
+        )
+        measured_circuit = QuantumCircuit(4, 4)
+        measured_circuit.measure(0, 1)
+        measured_circuit.measure(1, 0)
+        measured_circuit.measure(2, 2)
+        measured_circuit.measure(3, 3)
+        mapping = tuple(
+            replace(
+                binding,
+                measured_bit_index=(1 if binding.variable_index == 0 else 0)
+                if binding.variable_index < 2
+                else binding.measured_bit_index,
+            )
+            for binding in package.route_variable_mapping
+        )
+        mapped_package = replace(
+            package,
+            measured_circuit=measured_circuit,
+            route_variable_mapping=mapping,
+        )
+
+        decoded = decode_hardware_counts({"1001": 256}, mapped_package)
+
+        self.assertTrue(decoded.valid_route, decoded.message)
+        self.assertEqual(len(decoded.routes), 2)
 
     def test_result_distribution_is_never_replaced_by_local_answers(self) -> None:
         package = prepare_demo_qaoa_execution_package(
@@ -361,6 +520,7 @@ class IBMHardwareExecutionTests(unittest.TestCase):
         self.assertEqual(decoded.raw_counts, (("0000", 17),))
         self.assertFalse(decoded.valid_route)
         self.assertEqual(decoded.most_frequent_bitstring, "0000")
+        self.assertIsNone(decoded.selected_solution_bitstring)
         self.assertEqual(decoded.routes, ())
 
 

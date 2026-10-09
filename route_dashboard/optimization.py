@@ -61,6 +61,7 @@ def optimize_scenario(
             scenario.deliveries,
             scenario.travel,
             scenario.cost_weights,
+            feasible_routes=route_options,
         )
         validated_classical = validate_route_set(classical.routes, scenario)
         return OptimizationRun(
@@ -83,6 +84,7 @@ def optimize_scenario(
             scenario.travel,
             scenario.cost_weights,
             qaoa_config,
+            feasible_routes=route_options,
         )
     except (NoFeasibleQuantumSampleError, InvalidQuantumSampleError) as error:
         classical = optimize_classically(
@@ -90,6 +92,7 @@ def optimize_scenario(
             scenario.deliveries,
             scenario.travel,
             scenario.cost_weights,
+            feasible_routes=route_options,
         )
         validated_classical = validate_route_set(
             classical.routes,

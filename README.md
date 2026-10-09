@@ -1,4 +1,68 @@
-# Quantum-Enhanced Dynamic Last-Mile Route Optimisation
+# QuantumRoute — Quantum-Enhanced Dynamic Last-Mile Route Optimisation
+
+QuantumRoute is a Streamlit application that demonstrates hybrid classical
+and QAOA-based planning for small last-mile delivery scenarios. Its
+deterministic Demo Mode runs locally with Qiskit Aer; IBM Quantum is an
+optional, guarded pathway and is not required for the demo.
+
+## Quick Start
+
+From the repository root, install the dependencies and start the application:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+For a concise hackathon walkthrough, open **Demo Mode** and click
+**▶ Run Full Demo**. The fixed local scenario shows a feasible baseline,
+classical and local Aer results, simulated traffic and fleet changes,
+objective/sustainability comparisons, route maps, and saved local history.
+See the [official six-slide Qiskit Fall Fest submission](docs/QuantumRoute_Qiskit_Fall_Fest_Official_Template.pptx),
+[supplementary editable 10-slide presentation](docs/QuantumRoute-Hackathon-Presentation.pptx),
+[2–3 minute presenter script](docs/demo-script.md), and
+[slide source](docs/hackathon-presentation.md). No IBM hardware job is needed
+for this walkthrough.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    U[User] --> UI[Streamlit UI]
+    UI --> APP[Python application layer]
+    APP --> FEAS[Feasibility and route generation]
+    APP --> CLASSIC[Classical optimizer]
+    APP --> DYNAMIC[Dynamic traffic and fleet disruption]
+    APP --> OBJECTIVES[Cost, time, green, balanced objectives]
+    FEAS --> QUBO[QUBO route-selection formulation]
+    CLASSIC --> QUBO
+    OBJECTIVES --> QUBO
+    QUBO --> QAOA[QAOA / Qiskit]
+    QAOA --> AER[Local Qiskit Aer simulation]
+    QAOA -. Optional; guarded; explicit confirmation required .-> IBM[IBM Quantum hardware pathway]
+    AER --> VALID[Decode and feasibility validation]
+    IBM --> VALID
+    VALID --> OUT[Results and Folium map]
+    VALID --> HISTORY[Local SQLite operation history]
+```
+
+The IBM node is optional: opening the hardware workspace, discovering
+backends, and running a dry run do not submit a job. The workflow is restricted
+to its supported small Demo Mode problem and requires explicit confirmation
+before a real submission.
+
+## Technology Stack
+
+- **UI:** Streamlit
+- **Application and optimization:** Python; classical feasibility and route
+  optimization; simulated traffic/fleet re-optimization
+- **Quantum:** Qiskit, Qiskit Optimization, Qiskit Algorithms, and Qiskit Aer
+  for local QAOA
+- **Optional hardware:** IBM Quantum Runtime, with guarded execution
+- **Maps and routing:** Folium/Streamlit-Folium and optional OSRM road-routing
+  requests; OSRM paths are separate from optimizer route selection
+- **History:** SQLite
+- **Tests:** Python `unittest`
 
 ## Selected Problem Statement
 
@@ -97,6 +161,10 @@ Run the full test suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
+Verified on 2026-10-10 in the project `.venv`: **175 tests passed** with this
+command. Re-run it after changes; this count describes that run, not a promise
+about future test discovery.
+
 Run a reproducible small exact-versus-QAOA comparison with:
 
 ```powershell
@@ -114,25 +182,23 @@ variable mapping and the resulting route is rechecked for feasibility.
 ## Results and Observations
 
 The deterministic Demo Mode baseline produced the following physical metrics.
-The local values are reproducible from the checked-in scenario and optimizer;
-the IBM figures below describe the completed hardware result associated with
-this project. Automated IBM tests use mocks and do not independently reproduce
-a hardware execution.
+The local values are reproducible from the checked-in scenario and optimizer.
+The prior IBM hardware claim has no durable job ID/result artifact and is
+therefore **unverified**, not a verified hardware result. Automated IBM tests
+use mocks and do not independently reproduce a hardware execution.
 
 | Method | Distance | Travel time | Cost | Fuel | CO2 |
 |---|---:|---:|---:|---:|---:|
 | Classical Optimization | 18.225 km | 34.171 min | ₹1,854.19 | 1.640 L | 4.396 kg |
 | Local Aer QAOA | 18.225 km | 34.171 min | ₹1,854.19 | 1.640 L | 4.396 kg |
-| REAL IBM QUANTUM HARDWARE (`ibm_fez`, 256 shots, DONE) | approximately 18.22 km | approximately 34 min | approximately ₹1,853.85 | 1.640 L | 4.396 kg |
+| IBM Quantum hardware | **NOT VERIFIED** | — | — | — | — |
 
-The completed IBM hardware result passed the existing feasibility validation.
-The hardware measures bitstrings; the displayed distance, time, cost, fuel,
-and CO2 are calculated for the decoded route using the configured scenario
-model. The measured bitstring distribution is retained separately in the IBM
-Quantum Hardware workspace. Matching results on this small demonstration case
-do **not** demonstrate quantum advantage or quantum speedup. The hardware run
-demonstrates an actual Qiskit workflow executed on IBM Quantum hardware; it is
-not evidence that hardware was faster or that the result is globally optimal.
+Do not treat the older `ibm_fez, 256 shots` statement as verified. A new
+hardware result is reportable only when its durable JSON evidence and matching
+human-readable report exist under
+[`artifacts/ibm_hardware/`](artifacts/ibm_hardware/). A completed real hardware
+execution demonstrates the workflow, not quantum advantage, speedup, or global
+optimality.
 
 The deterministic Normal-to-Heavy traffic comparison retained the same route
 distance while increasing travel time and cost. Fuel and CO2 remained
@@ -141,7 +207,7 @@ unchanged because the configured fuel/emissions model depends on distance:
 | Traffic | Distance | Travel time | Cost | Fuel | CO2 |
 |---|---:|---:|---:|---:|---:|
 | Normal | approximately 18.225 km | approximately 34.171 min | approximately ₹1,854.19 | 1.640 L | 4.396 kg |
-| Heavy | approximately 18.225 km | approximately 52.965 min | approximately ₹2,497.47 | 1.640 L | 4.396 kg |
+| Heavy | approximately 18.225 km | approximately 52.965 min | approximately ₹2,497.46 | 1.640 L | 4.396 kg |
 
 In the standalone objective comparison, Green Priority produced approximately
 17.803 km, 33.382 min, ₹2,492.54 cost, 1.602 L fuel, and 4.294 kg CO2. This is a
@@ -208,10 +274,22 @@ Aer limit, and revalidates route sets before rendering them.
 
 When the OSRM option is enabled, the public OSRM table service supplies road
 distance and base duration; those table and route-geometry responses are cached
-in memory by coordinates. OSRM failures use the local coordinate estimate and
-are labeled in the dashboard. Without OSRM, the app makes no routing API calls.
-The Folium map uses OSRM road geometry only when it is returned successfully;
-otherwise it labels and draws straight-line/local route polylines.
+in memory by coordinates for up to five minutes. OSRM failures use the local
+coordinate estimate and are labeled in the dashboard. Without the OSRM scenario
+option, scenario construction makes no routing API calls. The Folium map uses
+OSRM road geometry only when it is returned successfully; otherwise it labels
+and draws straight-line/local route estimates.
+
+To compare actual road-path choices for one leg, select an origin and destination
+in the map panel and explicitly request OSRM alternatives. The request is bounded
+to three returned routes, uses a four-second timeout, and caches the response in
+memory for up to five minutes. Returned geometries are shown as separate,
+color-coded layers; missing or duplicate geometries are not synthesized. The
+comparison reports OSRM distance and duration with fuel, operating-cost, and
+tailpipe estimates from the selected scenario. Its recommendation reuses the
+dashboard's normalized objective weights and is display-only: the route
+optimizers and QAOA do not select among these road paths. The app's traffic
+multiplier is modeled locally; OSRM duration is not a live traffic feed.
 
 Before/after fuel use is estimated from route distance and the configured
 per-kilometer consumption factors. CO2 is an estimated tailpipe value using
@@ -341,6 +419,25 @@ QAOA remains stochastic, and its failure or skip status is shown without
 substitution. Fuel and CO2 use the configured per-distance estimates and
 tailpipe-only scope.
 
+### Hackathon presenter flow
+
+1. Start the app with `python -m streamlit run app.py`.
+2. In the sidebar, open **Demo Mode** and click **▶ Run Full Demo**.
+3. Walk through **Classical and local Aer results** and the **Quantum
+   Optimization** stages. Point out that feasibility checks remain classical
+   and that QAOA runs locally on Aer.
+4. Scroll to **Dynamic Traffic** and compare the displayed Normal/Heavy
+   before/after values; describe Heavy as a simulated scenario, not live data.
+5. Show **Fleet Disruption** (van-2 unavailable), reassignment/waitlist, and
+   updated metrics; then show the **objective trade-offs** and sustainability
+   summary.
+6. Optionally expand a route-map panel or open **History** to show the locally
+   saved demo runs. History navigation reads saved SQLite data and does not
+   rerun an optimizer.
+
+Allow roughly 2–3 minutes, including the local optimization run. No IBM
+hardware page or submission control is required.
+
 ## IBM Quantum Hardware Integration
 
 The **IBM Quantum Hardware** workspace supports user-initiated backend
@@ -364,20 +461,64 @@ limited to five required qubits; shots are configurable from 1 to 1,024, with
 After reviewing the dry-run details, a hardware job can be submitted only
 after the user checks the explicit REAL-hardware confirmation and selects
 **Submit ONE REAL IBM Quantum Job**. The submission path uses IBM Quantum
-Runtime and does not retry automatically. The job ID and state are kept in the
-current Streamlit session. **Refresh Job Status** manually queries that saved
-job; it does not submit another job. Results are fetched from the existing job
-after it reaches `DONE`.
+Runtime and does not retry automatically. Immediately before submission, the
+application writes a durable, run-ID-addressed manifest under
+[`artifacts/ibm_hardware/manifests/`](artifacts/ibm_hardware/manifests/).
+It snapshots the actual scenario and QUBO used, deterministic signature,
+optimizer configuration/history, parameters, QPY copies of logical and
+submitted circuits, logical/physical measurement and layout details, source
+hashes, package versions, selected backend, shots, and confirmation timestamp.
+If the manifest cannot be completed, the application does not submit. The job
+ID and subsequent status/result updates are also retained separately under
+[`artifacts/ibm_hardware/in_progress/`](artifacts/ibm_hardware/in_progress/).
+Those progress records are explicitly not verified evidence; final evidence is
+written only after the completed result is retrieved and validated. If the
+manifest or initial progress record cannot be persisted, the application does
+not submit.
+**Refresh Job Status** manually queries that saved job; it does not submit
+another job. Results are fetched from the existing job after it reaches `DONE`.
+
+After a real job reaches `DONE` and its measurement result is retrieved, the app
+stores a JSON record and Markdown report in
+[`artifacts/ibm_hardware/`](artifacts/ibm_hardware/). See that directory's
+README for evidence requirements. Evidence is rejected unless it links the
+exact confirmed pre-submission manifest, job ID, backend, returned register
+counts, requested shots, complete timestamps, and validated QUBO/circuit
+provenance. The record separately reports the evaluated QUBO objective for the
+decoded candidate and the route cost/impact metrics derived from the saved
+scenario. Mock, test, synthetic, and historical-recovery results are never
+valid hardware evidence.
+
+To inspect the historical job `db0l4kavog1s73fgvrbg` without submitting or
+running any job, use `python -m scripts.recover_ibm_job`. It reuses
+`IBM_QUANTUM_API_KEY` from the process environment or ignored local `.env` file
+and writes only to
+[`artifacts/ibm_hardware/unverified_recovery/`](artifacts/ibm_hardware/unverified_recovery/).
+Every recovery record is marked `UNVERIFIED_HISTORICAL_RECOVERY` and is not
+accepted as verified QuantumRoute hardware evidence.
 
 `ibm_qaoa_parameters.py` extracts genuine optimized parameters from the local
-Aer optimizer result for the Demo Mode QUBO. `ibm_qaoa_adapter.py` binds those
-parameters into the measured QAOA circuit and preserves the mapping from
-bitstrings to route variables. After explicit submission through IBM Quantum
-Runtime, the workspace retains the raw measurement distribution and most
-frequent bitstring. A decoded route is rechecked using the existing feasibility
-validation. Invalid results retain their measurements and are never replaced
-with an artificial route. Compatible completed results can be compared in Demo
-Mode; the comparison uses the saved result and does not make an IBM request.
+Aer optimizer result for the Demo Mode QUBO, including the captured optimizer
+evaluation history. `ibm_qaoa_adapter.py` binds those exact parameters into the
+measured QAOA circuit and preserves the mapping from bitstrings to route
+variables. After explicit submission through IBM Quantum Runtime, the workspace
+retains the raw register-specific measurement distribution and actual returned
+shot count. A decoded candidate route is rechecked using the same recorded QUBO
+and scenario; frequency does not establish optimality. Invalid results retain
+their measurements and are never replaced with an artificial route.
+Compatible completed results can be compared in Demo Mode only when they share
+the same recorded problem instance and objective; the comparison uses the
+saved result and does not make an IBM request.
+
+On 2026-10-10, IBM authentication, read-only backend discovery (three
+account-visible backends), and the optimized-QAOA hardware dry-run check were
+verified. The dry run reported `ready_for_confirmation` after checking an
+operational real backend and locally transpiling the five-qubit circuit. It did
+not submit a job or run a hardware circuit. This verification is not a
+hardware result and does not establish quantum advantage. The local
+`IBM_QUANTUM_API_KEY` is loaded from the ignored `.env`; never add its value to
+source code, this README, or Git. A placeholder-only `.env.example` is provided
+for new local setups.
 
 ## Limitations
 
@@ -392,9 +533,10 @@ Mode; the comparison uses the saved result and does not make an IBM request.
 	not used.
 - Fuel use is calculated from configured per-distance consumption and CO2 is
 	estimated tailpipe emissions. Lifecycle and grid emissions are not modeled.
-- Real hardware comparison is demonstrated on the supported small Demo Mode
-	case. Matching results do not demonstrate quantum advantage or speedup, and
-	no solver is claimed to be globally optimal from the hardware measurement.
+- The real hardware comparison is available for the supported small Demo Mode
+	case after an explicitly confirmed execution. No verified hardware result is
+	currently recorded; matching results do not demonstrate quantum advantage or
+	speedup, and no solver is claimed to be globally optimal from a measurement.
 - Optional OSRM requests provide road-routing information, not live traffic.
 	Coordinate estimates are used when OSRM is not requested or is unavailable.
 
@@ -410,11 +552,13 @@ Mode; the comparison uses the saved result and does not make an IBM request.
 
 ## Presentation / Demo File
 
-The interactive Demo Mode is available in the application.
-
-Presentation/Demo: To be attached before final submission.
-
-No presentation deck, PDF, or video file is currently present in this repository.
+The interactive Demo Mode is available in the application. The editable,
+10-slide PowerPoint pitch is
+[`docs/QuantumRoute-Hackathon-Presentation.pptx`](docs/QuantumRoute-Hackathon-Presentation.pptx).
+Its slide source is
+[`docs/hackathon-presentation.md`](docs/hackathon-presentation.md); the spoken
+walkthrough and judge Q&A are in
+[`docs/demo-script.md`](docs/demo-script.md).
 
 ## Project Documentation
 
@@ -444,3 +588,27 @@ The built-in routing scenarios are generated by this project; no external
 delivery dataset is claimed. **Official VNQFF-08 organizer source:** to be
 added when available. No official problem-statement URL was present in this
 repository, so none is invented here.
+
+## Local operation history
+
+Completed dashboard optimizations are stored in a versioned SQLite database
+under the current user's application-data directory
+(`%LOCALAPPDATA%\QuantumRoute\quantumroute_history.sqlite3` on Windows,
+`$XDG_DATA_HOME/QuantumRoute/quantumroute_history.sqlite3` on Linux/macOS).
+The database uses SQLite WAL mode, indexed history filters, and idempotent run
+IDs. It is intentionally outside the source tree; the matching
+`data/quantumroute_history.sqlite3*` pattern is ignored if a local deployment
+places the database in the repository's `data` directory.
+
+History is local to this machine and is not encrypted or synchronized. Back it
+up using SQLite's online backup API, or stop the application and copy the
+database together with any `-wal`/`-shm` sidecars. There is no automatic cloud
+backup or export in this phase. Records retain inputs and outputs captured by
+that run; opening them does not refresh routing data or rerun an optimizer.
+
+The optional semantic-memory interface is disabled by default. No Hindsight
+endpoint, credentials, model configuration, dependency, or network integration
+is configured. A local outbox records compact summaries with stable SQLite run
+IDs for a future adapter, but does not send them. Recalled summaries, once a
+provider is configured, must resolve to their SQLite record before displaying
+exact operation details.

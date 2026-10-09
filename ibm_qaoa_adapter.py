@@ -17,6 +17,7 @@ from quantum_route_optimisation.classical import generate_feasible_routes
 from quantum_route_optimisation.qubo import RouteQubo, build_route_qubo
 from route_dashboard.demo_mode import build_hackathon_demo_scenario
 from route_dashboard.objectives import ObjectiveConfig, ObjectiveName, scenario_for_objective
+from route_dashboard.scenario import ScenarioProblem
 
 
 MAX_DEMO_QUBITS = 5
@@ -77,6 +78,16 @@ class QAOAExecutionPackage:
     problem_signature: str
     route_variable_mapping: tuple[RouteVariableBinding, ...]
     validation: CircuitValidation
+    formulation: RouteQubo | None = field(default=None, repr=False, compare=False)
+    scenario: ScenarioProblem | None = field(default=None, repr=False, compare=False)
+    objective_scenario: ScenarioProblem | None = field(default=None, repr=False, compare=False)
+    logical_circuit: QuantumCircuit | None = field(default=None, repr=False, compare=False)
+    measured_circuit: QuantumCircuit | None = field(default=None, repr=False, compare=False)
+    optimizer_metadata: Mapping[str, object] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 def qaoa_parameter_names(reps: int = 1) -> tuple[str, ...]:
@@ -102,18 +113,24 @@ def qaoa_parameter_alias(parameter_name: str) -> str:
 
 def build_demo_route_qubo() -> RouteQubo:
     """Build the exact Cost Priority route QUBO used by Demo Mode."""
+    return build_demo_route_problem()[2]
+
+
+def build_demo_route_problem() -> tuple[ScenarioProblem, ScenarioProblem, RouteQubo]:
+    """Return the exact scenario pair and QUBO used by the hardware demo."""
     scenario = build_hackathon_demo_scenario()
-    cost_scenario = scenario_for_objective(
+    objective_scenario = scenario_for_objective(
         scenario,
         ObjectiveConfig.for_name(ObjectiveName.COST),
     )
     feasible_routes = generate_feasible_routes(
-        cost_scenario.vehicles,
-        cost_scenario.deliveries,
-        cost_scenario.travel,
-        cost_scenario.cost_weights,
+        objective_scenario.vehicles,
+        objective_scenario.deliveries,
+        objective_scenario.travel,
+        objective_scenario.cost_weights,
     )
-    return build_route_qubo(feasible_routes, cost_scenario.deliveries)
+    formulation = build_route_qubo(feasible_routes, objective_scenario.deliveries)
+    return scenario, objective_scenario, formulation
 
 
 def route_qubo_fingerprint(formulation: RouteQubo) -> str:
@@ -151,14 +168,24 @@ def prepare_demo_qaoa_execution_package(
     reps: int = 1,
 ) -> QAOAExecutionPackage:
     """Build the existing deterministic Demo Mode QUBO and prepare it locally."""
-    formulation = build_demo_route_qubo()
-    return prepare_route_qaoa_execution_package(formulation, parameter_bindings, reps)
+    scenario, objective_scenario, formulation = build_demo_route_problem()
+    return prepare_route_qaoa_execution_package(
+        formulation,
+        parameter_bindings,
+        reps,
+        scenario=scenario,
+        objective_scenario=objective_scenario,
+    )
 
 
 def prepare_route_qaoa_execution_package(
     formulation: RouteQubo,
     parameter_bindings: Mapping[str, Real],
     reps: int = 1,
+    *,
+    scenario: ScenarioProblem | None = None,
+    objective_scenario: ScenarioProblem | None = None,
+    optimizer_metadata: Mapping[str, object] | None = None,
 ) -> QAOAExecutionPackage:
     """Bind a small route-QUBO QAOA ansatz and validate it by local transpilation."""
     expected_parameter_names = qaoa_parameter_names(reps)
@@ -297,5 +324,10 @@ def prepare_route_qaoa_execution_package(
             coupling_map=REPRESENTATIVE_COUPLING_MAP,
             transpiled_depth=compiled_circuit.depth(),
         ),
+        formulation=formulation,
+        scenario=scenario,
+        objective_scenario=objective_scenario,
+        logical_circuit=bound_circuit,
+        measured_circuit=measured_circuit,
+        optimizer_metadata=optimizer_metadata,
     )
-

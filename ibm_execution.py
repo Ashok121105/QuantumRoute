@@ -18,7 +18,7 @@ from typing import Mapping
 
 from qiskit import QuantumCircuit, transpile
 
-from ibm_quantum import IBMBackendMetadata, IBMQuantumConnection, IBMQuantumStatus
+from ibm_quantum import IBMBackendMetadata, IBMQuantumConnection
 
 
 DEFAULT_SHOTS = 256
@@ -79,23 +79,55 @@ class HardwareRouteDecode:
     valid_route: bool
     message: str
     routes: tuple[object, ...] = ()
+    qubo_objective_value: float | None = None
+    selected_solution_bitstring: str | None = None
 
 
 @dataclass
 class HardwareJobState:
     submission_attempted: bool = False
+    is_real_hardware_execution: bool = False
     job_id: str | None = None
     backend_name: str | None = None
     shots: int | None = None
     status: str = "No job submitted yet"
     submitted_at: str | None = None
+    completed_at: str | None = None
     message: str = "No job submitted yet"
+    error_info: str | None = None
     raw_counts: tuple[tuple[str, int], ...] = ()
     most_frequent_bitstring: str | None = None
     route_valid: bool | None = None
     decoded_routes: tuple[object, ...] = ()
     route_message: str | None = None
     measurement_result_received: bool = False
+    execution_package: object | None = field(default=None, repr=False, compare=False)
+    run_id: str | None = None
+    manifest_path: str | None = None
+    manifest_sha256: str | None = None
+    execution_manifest: Mapping[str, object] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    confirmation_timestamp: str | None = None
+    actual_backend_name: str | None = None
+    submitted_circuit: QuantumCircuit | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    result_register_counts: Mapping[str, Mapping[str, object]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    shots_returned: int | None = None
+    qubo_objective_value: float | None = None
+    progress_record_path: str | None = None
+    selected_solution_bitstring: str | None = None
+    actual_backend_is_simulator: bool | None = None
+    runtime_submitted_at: str | None = None
 
 
 DEMO_ROUTE_VARIABLE_COUNT = 4
@@ -399,13 +431,7 @@ def submit_confirmed_hardware_job(
             state.message = "A hardware job is already active or has an unknown submission outcome."
             return state
 
-        state.submission_attempted = True
-        state.backend_name = dry_run.backend.name
-        state.shots = dry_run.shots
-        state.status = "SUBMISSION_ATTEMPTED"
-        state.message = "Submission requested; checking backend and submitting one job."
-        _submission_outcome_unknown = True
-
+        sampler_invoked = False
         try:
             backend = connection.service.backend(dry_run.backend.name)
             if getattr(backend, "name", None) != dry_run.backend.name:
@@ -417,24 +443,70 @@ def submit_confirmed_hardware_job(
 
             runtime = importlib.import_module("qiskit_ibm_runtime")
             sampler = runtime.SamplerV2(mode=backend)
+            from ibm_hardware_provenance import (
+                build_execution_manifest,
+                write_pre_submission_manifest,
+            )
+
+            confirmation_timestamp = datetime.now(timezone.utc).isoformat()
+            manifest = build_execution_manifest(
+                dry_run,
+                confirmation_timestamp=confirmation_timestamp,
+            )
+            manifest_path, manifest_sha256 = write_pre_submission_manifest(manifest)
+            state.run_id = str(manifest["run_id"])
+            state.manifest_path = str(manifest_path)
+            state.manifest_sha256 = manifest_sha256
+            state.execution_manifest = manifest
+            state.confirmation_timestamp = confirmation_timestamp
+            state.backend_name = dry_run.backend.name
+            state.shots = dry_run.shots
+            state.execution_package = dry_run.execution_package
+            state.submitted_circuit = dry_run.transpiled_circuit
+            state.submission_attempted = True
+            state.status = "SUBMISSION_ATTEMPTED"
+            state.message = "Confirmed request recorded; submitting one job."
+            state.submitted_at = datetime.now(timezone.utc).isoformat()
+            from ibm_hardware_provenance import write_execution_progress
+
+            state.progress_record_path = str(write_execution_progress(state))
+            _submission_outcome_unknown = True
+            sampler_invoked = True
             job = sampler.run([dry_run.transpiled_circuit], shots=dry_run.shots)
             job_id_value = job.job_id()
             if not isinstance(job_id_value, str) or not job_id_value.strip():
                 raise RuntimeError("Runtime did not provide a job ID")
-        except Exception:
+        except Exception as error:
+            if not sampler_invoked:
+                state.status = "PROVENANCE_FAILED"
+                state.message = (
+                    "Execution provenance could not be saved completely; "
+                    "no hardware job was submitted."
+                )
+                state.error_info = f"Pre-submission provenance failed ({type(error).__name__})."
+                _persist_execution_progress(state)
+                return state
             state.status = "SUBMISSION_UNKNOWN"
             state.message = (
                 "Submission outcome could not be verified. No retry was attempted; "
                 "check the IBM Quantum job dashboard before taking further action."
             )
+            _persist_execution_progress(state)
             return state
-
         state.job_id = job_id_value
+        state.is_real_hardware_execution = True
         state.status = "SUBMITTED"
-        state.submitted_at = _safe_creation_time(job)
         state.message = "REAL IBM QUANTUM HARDWARE job submitted once. Refresh status to inspect it."
         _active_job_id = job_id_value
         _submission_outcome_unknown = False
+        try:
+            from ibm_hardware_provenance import write_execution_progress
+
+            state.progress_record_path = str(write_execution_progress(state))
+        except (OSError, ValueError):
+            state.error_info = (
+                "Job ID is known, but the durable execution progress record could not be updated."
+            )
         return state
     finally:
         _submission_lock.release()
@@ -460,25 +532,106 @@ def refresh_hardware_job_status(
         raw_status = job.status()
         status = _status_text(raw_status)
         state.status = status
-        if status.upper() == "DONE" and not state.measurement_result_received:
-            runtime_result = job.result()
-            raw_counts = _sampler_counts(runtime_result, execution_package)
-            decoded = decode_hardware_counts(raw_counts, execution_package)
-            state.raw_counts = decoded.raw_counts
-            state.most_frequent_bitstring = decoded.most_frequent_bitstring
-            state.route_valid = decoded.valid_route
-            state.decoded_routes = decoded.routes
-            state.route_message = decoded.message
-            state.measurement_result_received = True
-            state.message = decoded.message
+        if status.upper() == "DONE":
+            if not state.measurement_result_received:
+                runtime_result = job.result()
+                register_counts = _sampler_register_counts(runtime_result)
+                expected_registers = tuple(
+                    register.name
+                    for register in getattr(state.submitted_circuit, "cregs", ())
+                )
+                if (
+                    len(expected_registers) != 1
+                    or set(register_counts) != set(expected_registers)
+                ):
+                    raise ValueError(
+                        "Runtime result registers do not match submitted circuit registers"
+                    )
+                register_name = expected_registers[0]
+                register_data = register_counts[register_name]
+                raw_counts = register_data["counts"]
+                if not isinstance(raw_counts, Mapping):
+                    raise ValueError("Runtime measurement counts were unavailable")
+                state.result_register_counts = register_counts
+                state.shots_returned = sum(raw_counts.values())
+                decoded = decode_hardware_counts(raw_counts, execution_package)
+                state.completed_at = _safe_completion_time(job)
+                state.raw_counts = decoded.raw_counts
+                state.most_frequent_bitstring = decoded.most_frequent_bitstring
+                state.selected_solution_bitstring = decoded.selected_solution_bitstring
+                state.route_valid = decoded.valid_route
+                state.decoded_routes = decoded.routes
+                state.qubo_objective_value = decoded.qubo_objective_value
+                state.route_message = decoded.message
+                state.measurement_result_received = True
+                state.message = decoded.message
+
+            limitations = []
+            if state.route_valid is not True:
+                limitations.append(
+                    state.route_message or "No measured route passed feasibility validation."
+                )
+            if state.completed_at is None:
+                limitations.append(
+                    "Runtime completion timestamp is unavailable; evidence is incomplete."
+                )
+            try:
+                actual_backend = job.backend()
+                actual_name = getattr(actual_backend, "name", None)
+                if callable(actual_name):
+                    actual_name = actual_name()
+                if isinstance(actual_name, str):
+                    state.actual_backend_name = actual_name
+                else:
+                    state.actual_backend_name = None
+                    limitations.append(
+                        "Runtime did not provide actual backend metadata; evidence is incomplete."
+                    )
+                simulator = getattr(actual_backend, "simulator", None)
+                state.actual_backend_is_simulator = (
+                    simulator if isinstance(simulator, bool) else None
+                )
+                if state.actual_backend_is_simulator is None:
+                    limitations.append(
+                        "Runtime did not provide actual backend type metadata; "
+                        "evidence is incomplete."
+                    )
+                elif state.actual_backend_is_simulator:
+                    limitations.append(
+                        "Retrieved job backend is a simulator; it cannot be recorded as hardware evidence."
+                    )
+                if (
+                    state.actual_backend_name is not None
+                    and state.actual_backend_name != state.backend_name
+                ):
+                    limitations.append(
+                        "Retrieved job backend does not match the requested backend."
+                    )
+                creation_date = getattr(job, "creation_date", None)
+                if isinstance(creation_date, datetime):
+                    state.runtime_submitted_at = creation_date.isoformat()
+                elif isinstance(creation_date, str):
+                    state.runtime_submitted_at = creation_date
+            except Exception:
+                state.actual_backend_name = None
+                state.actual_backend_is_simulator = None
+                limitations.append(
+                    "Runtime did not provide actual backend metadata; evidence is incomplete."
+                )
+            state.error_info = " ".join(limitations) or None
+            state.message = state.error_info or state.message
         elif status.upper() in {"ERROR", "CANCELLED"}:
             state.message = f"IBM job reached terminal status: {status}."
+            state.error_info = state.message
         else:
             state.message = f"Existing IBM job status: {status}."
     except Exception:
         state.message = "Could not refresh the existing IBM job. No new job was submitted."
+        state.error_info = state.message
+        _persist_execution_progress(state)
         return state
 
+    _persist_execution_progress(state)
     if state.status.upper() in {"DONE", "ERROR", "CANCELLED"}:
         with _submission_lock:
             if _active_job_id == state.job_id:
@@ -486,25 +639,63 @@ def refresh_hardware_job_status(
     return state
 
 
+def _persist_execution_progress(state: HardwareJobState) -> None:
+    if not state.run_id or not state.manifest_path:
+        return
+    try:
+        from ibm_hardware_provenance import write_execution_progress
+
+        state.progress_record_path = str(write_execution_progress(state))
+    except (OSError, ValueError):
+        state.error_info = (
+            "Execution state changed, but its durable progress record could not be updated."
+        )
+
+
 def decode_hardware_counts(
     counts: Mapping[str, int],
     execution_package: object,
 ) -> HardwareRouteDecode:
-    """Decode the most frequent hardware bitstring through the adapter mapping."""
-    from ibm_qaoa_adapter import build_demo_route_qubo, route_qubo_fingerprint
+    """Select the lowest-QUBO-energy feasible candidate from observed outcomes."""
+    from ibm_qaoa_adapter import route_qubo_fingerprint
     from quantum_route_optimisation.qaoa import decode_route_selection
-    from route_dashboard.demo_mode import build_hackathon_demo_scenario
-    from route_dashboard.objectives import ObjectiveConfig, ObjectiveName, scenario_for_objective
     from route_dashboard.optimization import validate_route_set
 
-    raw_counts = tuple(sorted((str(bitstring), int(count)) for bitstring, count in counts.items()))
-    if not raw_counts or any(count < 0 for _, count in raw_counts):
+    if not counts or any(
+        not isinstance(bitstring, str)
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+        for bitstring, count in counts.items()
+    ):
+        return HardwareRouteDecode(
+            (),
+            None,
+            False,
+            "Hardware result did not produce a valid route: measurement counts were unavailable or malformed.",
+        )
+    if sum(counts.values()) < 1:
+        return HardwareRouteDecode(
+            (),
+            None,
+            False,
+            "Hardware result did not produce a valid route: no measurement shots were returned.",
+        )
+    raw_counts = tuple(sorted(counts.items()))
+    if not raw_counts:
         return HardwareRouteDecode(raw_counts, None, False, "Hardware result did not produce a valid route: no measurement counts were returned.")
 
     most_frequent = sorted(raw_counts, key=lambda item: (-item[1], item[0]))[0][0]
     package_signature = getattr(execution_package, "problem_signature", None)
-    formulation = build_demo_route_qubo()
-    if package_signature != route_qubo_fingerprint(formulation):
+    formulation = getattr(execution_package, "formulation", None)
+    scenario = getattr(execution_package, "scenario", None)
+    objective_scenario = getattr(execution_package, "objective_scenario", None)
+    if (
+        formulation is None
+        or scenario is None
+        or objective_scenario is None
+        or package_signature != route_qubo_fingerprint(formulation)
+    ):
         return HardwareRouteDecode(
             raw_counts,
             most_frequent,
@@ -513,6 +704,7 @@ def decode_hardware_counts(
         )
 
     circuit = getattr(execution_package, "circuit", None)
+    measured_circuit = getattr(execution_package, "measured_circuit", None)
     mapping = tuple(getattr(execution_package, "route_variable_mapping", ()))
     clbit_count = getattr(circuit, "num_clbits", None)
     variable_count = getattr(
@@ -522,6 +714,8 @@ def decode_hardware_counts(
     )
     if (
         clbit_count is None
+        or measured_circuit is None
+        or measured_circuit.num_clbits != clbit_count
         or variable_count != DEMO_ROUTE_VARIABLE_COUNT
         or len(mapping) != DEMO_ROUTE_VARIABLE_COUNT
         or tuple(item.variable_index for item in mapping) != tuple(range(variable_count))
@@ -533,49 +727,93 @@ def decode_hardware_counts(
             False,
             "Hardware result did not produce a valid route: adapter measurement mapping is invalid.",
         )
+    actual_measurements = {
+        (
+        measured_circuit.find_bit(item.qubits[0]).index,
+        measured_circuit.find_bit(item.clbits[0]).index,
+        )
+        for item in measured_circuit.data
+        if item.operation.name == "measure"
+    }
+    if actual_measurements != {
+        (item.logical_qubit_index, item.measured_bit_index) for item in mapping
+    }:
+        return HardwareRouteDecode(
+        raw_counts,
+        most_frequent,
+        False,
+        "Hardware result did not produce a valid route: logical measurement wiring did not match the execution package.",
+        )
 
-    normalized_bitstring = most_frequent.replace(" ", "")
-    if len(normalized_bitstring) != clbit_count or any(bit not in "01" for bit in normalized_bitstring):
+    candidates: list[tuple[float, int, str, tuple[object, ...]]] = []
+    for bitstring, frequency in raw_counts:
+        if frequency == 0:
+            continue
+        normalized_bitstring = bitstring.replace(" ", "")
+        if (
+            len(normalized_bitstring) != clbit_count
+            or any(bit not in "01" for bit in normalized_bitstring)
+        ):
+            return HardwareRouteDecode(
+                raw_counts,
+                most_frequent,
+                False,
+                "Hardware result did not produce a valid route: measurement bitstring width is invalid.",
+            )
+
+        little_endian_bits = normalized_bitstring[::-1]
+        bit_vector = [
+            int(little_endian_bits[item.measured_bit_index])
+            for item in sorted(mapping, key=lambda entry: entry.variable_index)
+        ]
+        try:
+            qubo_objective_value = float(
+                formulation.problem.objective.evaluate(bit_vector)
+            )
+            if not isfinite(qubo_objective_value):
+                raise ValueError("QUBO objective is not finite")
+        except (ArithmeticError, TypeError, ValueError):
+            return HardwareRouteDecode(
+                raw_counts,
+                most_frequent,
+                False,
+                "Hardware result did not produce a valid route: original QUBO objective could not be evaluated.",
+            )
+        try:
+            decoded = decode_route_selection(
+                bit_vector,
+                formulation,
+                objective_scenario.vehicles,
+                objective_scenario.deliveries,
+                objective_scenario.travel,
+                objective_scenario.cost_weights,
+            )
+            physical_routes = validate_route_set(decoded.routes, scenario)
+        except ValueError:
+            continue
+        candidates.append(
+            (qubo_objective_value, frequency, normalized_bitstring, tuple(physical_routes))
+        )
+
+    if not candidates:
         return HardwareRouteDecode(
             raw_counts,
             most_frequent,
             False,
-            "Hardware result did not produce a valid route: measurement bitstring width is invalid.",
+            "Hardware result did not produce a valid route: no observed assignment passed feasibility validation.",
+            (),
+            None,
         )
-
-    little_endian_bits = normalized_bitstring[::-1]
-    bit_vector = [
-        int(little_endian_bits[item.measured_bit_index])
-        for item in sorted(mapping, key=lambda entry: entry.variable_index)
-    ]
-    scenario = build_hackathon_demo_scenario()
-    scoring_scenario = scenario_for_objective(
-        scenario,
-        ObjectiveConfig.for_name(ObjectiveName.COST),
-    )
-    try:
-        decoded = decode_route_selection(
-            bit_vector,
-            formulation,
-            scoring_scenario.vehicles,
-            scoring_scenario.deliveries,
-            scoring_scenario.travel,
-            scoring_scenario.cost_weights,
-        )
-        physical_routes = validate_route_set(decoded.routes, scenario)
-    except Exception:
-        return HardwareRouteDecode(
-            raw_counts,
-            most_frequent,
-            False,
-            "Hardware result did not produce a valid route: measured assignment failed feasibility validation.",
-        )
+    candidates.sort(key=lambda item: (item[0], -item[1], item[2]))
+    objective, _, selected_bitstring, routes = candidates[0]
     return HardwareRouteDecode(
         raw_counts,
         most_frequent,
         True,
-        "Hardware result decoded to a route that passed existing feasibility validation.",
-        tuple(physical_routes),
+        "Lowest-QUBO-energy observed candidate decoded to a route that passed existing feasibility validation.",
+        routes,
+        objective,
+        selected_bitstring,
     )
 
 
@@ -595,16 +833,30 @@ def _failed(
     )
 
 
-def _safe_creation_time(job: object) -> str:
+def _safe_completion_time(job: object) -> str | None:
     try:
-        value = getattr(job, "creation_date", None)
-        if callable(value):
-            value = value()
-        if value is not None:
-            return value.isoformat() if hasattr(value, "isoformat") else str(value)
+        metrics = getattr(job, "metrics", None)
+        if callable(metrics):
+            timestamps = metrics().get("timestamps", {})
+            if isinstance(timestamps, Mapping):
+                finished = timestamps.get("finished")
+                if isinstance(finished, str):
+                    return finished
     except Exception:
         pass
-    return datetime.now(timezone.utc).isoformat()
+    for attribute in ("time_completed", "completion_date", "end_time"):
+        try:
+            value = getattr(job, attribute, None)
+            if callable(value):
+                value = value()
+            if value is not None:
+                if hasattr(value, "isoformat"):
+                    return value.isoformat()
+                if isinstance(value, str):
+                    return value
+        except Exception:
+            continue
+    return None
 
 
 def _status_text(value: object) -> str:
@@ -614,19 +866,35 @@ def _status_text(value: object) -> str:
     return str(getattr(value, "value", value))
 
 
-def _sampler_counts(result: object, execution_package: object) -> Mapping[str, int]:
-    circuit = getattr(execution_package, "circuit", None)
-    for register in getattr(circuit, "cregs", ()):
-        try:
-            bit_array = getattr(result[0].data, register.name)
-            get_counts = getattr(bit_array, "get_counts", None)
-            if callable(get_counts):
-                counts = get_counts()
-                if isinstance(counts, Mapping):
-                    return counts
-        except (AttributeError, IndexError, TypeError):
+def _sampler_register_counts(result: object) -> dict[str, dict[str, object]]:
+    try:
+        pub_results = tuple(result)
+    except TypeError as error:
+        raise ValueError("Runtime result is not an iterable Sampler V2 result") from error
+    if len(pub_results) != 1:
+        raise ValueError("Runtime result must contain exactly one Sampler V2 PUB")
+    data = getattr(pub_results[0], "data", None)
+    keys = getattr(data, "keys", None)
+    if not callable(keys):
+        raise ValueError("Runtime Sampler V2 result has no enumerable data registers")
+    registers: dict[str, dict[str, object]] = {}
+    for raw_name in keys():
+        name = str(raw_name)
+        bit_array = data[raw_name]
+        get_counts = getattr(bit_array, "get_counts", None)
+        if not callable(get_counts):
             continue
-    raise ValueError("Runtime result contained no sampler measurement register")
+        counts = get_counts()
+        if not isinstance(counts, Mapping):
+            raise ValueError(f"Runtime result register {name} has invalid counts")
+        registers[name] = {
+            "counts": dict(counts),
+            "num_bits": getattr(bit_array, "num_bits", None),
+            "num_shots": getattr(bit_array, "num_shots", None),
+        }
+    if not registers:
+        raise ValueError("Runtime result contained no Sampler measurement registers")
+    return registers
 
 
 def _optional_string(value: object, attribute: str) -> str | None:
