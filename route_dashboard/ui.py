@@ -2,17 +2,34 @@
 
 from datetime import time
 from hashlib import sha256
-from math import isclose
+from math import isclose, isfinite
 from pathlib import Path
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 
 from quantum_route_optimisation import QAOAConfig
 
 from .dynamic import TrafficReoptimization, calculate_route_impact, reoptimize_for_traffic
+from .custom_routes import (
+    CustomRouteScore,
+    PlaceResult,
+    build_custom_route_map,
+    build_custom_route_tilted_map,
+    custom_route_objectives,
+    route_recommendation_explanation,
+    score_custom_route_alternatives,
+    search_places,
+)
+from .fleet_upload import (
+    FLEET_TEMPLATE_COLUMNS,
+    FLEET_TEMPLATE_CSV,
+    REQUIRED_FLEET_COLUMNS,
+    validate_fleet_upload,
+)
 from .demo_mode import (
     DEMO_BREAKDOWN_VEHICLE,
     DEMO_QAOA_CONFIG,
@@ -83,6 +100,7 @@ from .scenario import (
     DeliveryStop,
     ScenarioProblem,
     build_scenario,
+    canonical_fuel_type,
     demo_stops,
 )
 from .routing import get_osrm_route_alternatives
@@ -105,6 +123,11 @@ DEFAULT_ROWS = [
     }
     for stop in demo_stops()
 ]
+
+_browser_location_component = components.declare_component(
+    "quantumroute_browser_location",
+    path=str(Path(__file__).parent / "components" / "geolocation"),
+)
 
 
 def main() -> None:
@@ -161,6 +184,8 @@ def main() -> None:
         _render_fleet_disruption(qaoa_config)
     elif page == "Demo Mode":
         _render_demo_mode()
+    elif page == "Custom Route Planner":
+        _render_custom_route_planner()
     elif page == "History":
         render_history_page()
     elif page == "IBM Quantum Hardware":
@@ -183,6 +208,7 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
             "Dynamic Traffic": "traffic",
             "Fleet Disruption": "local_shipping",
             "Demo Mode": "slideshow",
+            "Custom Route Planner": "pin_drop",
             "Benchmark Mode": "query_stats",
             "IBM Quantum Hardware": "memory",
             "History": "history",
@@ -196,6 +222,7 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
                 "Fleet Disruption",
                 "IBM Quantum Hardware",
                 "Demo Mode",
+                "Custom Route Planner",
                 "Benchmark Mode",
                 "History",
             ),
@@ -241,6 +268,7 @@ def _render_page_header(page: str, current: dict[str, object] | None) -> None:
         "Dynamic Traffic": "Dynamic traffic",
         "Fleet Disruption": "Fleet disruption",
         "Demo Mode": "Demo Mode",
+        "Custom Route Planner": "Custom Route Planner",
         "Benchmark Mode": "Benchmark laboratory",
         "IBM Quantum Hardware": "IBM Quantum Hardware",
         "History": "Operation history",
@@ -2000,34 +2028,146 @@ def _render_demo_quantum_optimization(demo: HackathonDemoResult) -> None:
     st.caption(
         "The same validated route problem is followed through its existing QUBO and local QAOA workflow."
     )
-    stages = st.columns(5, gap="small")
-    explanations = (
-        ("Classical optimizer", "Builds and validates feasible vehicle routes."),
+    st.markdown("### Workflow overview · architecture, not a live execution trace")
+    workflow_rows = (
         (
-            "QUBO formulation",
-            "Binary route variables; penalties enforce exact delivery coverage and one route per vehicle.",
+            (
+                "01 · Delivery inputs and constraints",
+                "Vehicles, deliveries, capacity, shifts, travel data, and cost objective define the problem.",
+            ),
+            (
+                "02 · Classical feasibility",
+                "Python enumerates route options that pass the existing route feasibility checks.",
+            ),
+            (
+                "03 · QUBO formulation",
+                "Each feasible vehicle-route option becomes one binary variable; penalties encode exact coverage and one route per vehicle.",
+            ),
+            (
+                "04 · QAOA",
+                "A parameterized QAOA circuit searches binary route selections for lower QUBO energy.",
+            ),
         ),
-        ("QAOA", f"Variational circuit at depth {DEMO_QAOA_CONFIG.reps} samples route selections."),
-        ("Local simulation", "Qiskit Aer samples the circuit locally; measurements are stochastic."),
-        ("Decode + validate", "Measured bits map to routes, which pass the existing feasibility checks."),
+        (
+            (
+                "05 · Qiskit Aer simulation",
+                "The local Aer simulator samples the QAOA circuit; this is not IBM hardware execution.",
+            ),
+            (
+                "06 · Candidate decoding",
+                "Python maps measured binary values back to the route-option variables.",
+            ),
+            (
+                "07 · Feasibility validation",
+                "Decoded assignments are checked for exact delivery coverage, unique vehicles, and route feasibility.",
+            ),
+            (
+                "08 · Route results",
+                "Validated routes and their calculated distance, time, and cost are presented.",
+            ),
+        ),
     )
-    for column, (heading, explanation) in zip(stages, explanations):
-        with column.container(border=True):
-            column.markdown(f"#### {heading}")
-            column.caption(explanation)
+    for row_index, stages in enumerate(workflow_rows):
+        columns = st.columns(4, gap="small")
+        displayed_stages = stages if row_index == 0 else tuple(reversed(stages))
+        for index, (column, (heading, explanation)) in enumerate(
+            zip(columns, displayed_stages)
+        ):
+            with column.container(border=True):
+                st.markdown(f"#### {heading}")
+                st.caption(explanation)
+                if row_index == 0 and index < len(stages) - 1:
+                    st.caption("→")
+                elif row_index == 0:
+                    st.caption("↓ continue")
+                elif index > 0:
+                    st.caption("←")
+    st.caption(
+        "The diagram describes the application architecture; it does not depict circuit "
+        "states, measurement counts, or hardware activity."
+    )
 
     status = demo.baseline_qaoa
+    run = demo.baseline_run
+    quantum_result = run.quantum_result
+    if status.executed:
+        execution_label = "Local Qiskit Aer executed"
+    else:
+        execution_label = "Local Qiskit Aer not run"
+    st.markdown("### Current Demo baseline · actual execution")
+    st.caption(
+        f"{execution_label} · QAOA depth {DEMO_QAOA_CONFIG.reps} · "
+        f"optimizer iteration limit {DEMO_QAOA_CONFIG.maxiter} · "
+        f"requested sampler shots {DEMO_QAOA_CONFIG.shots}. "
+        "This is separate from the IBM Quantum Hardware workspace."
+    )
+    result_columns = st.columns(4, gap="small")
+    result_columns[0].metric(
+        "Feasible route options / QUBO variables",
+        demo.baseline_candidate_count,
+    )
+    result_columns[1].metric(
+        "Feasibility validation",
+        (
+            "Passed" if status.valid else "Failed"
+        )
+        if status.executed
+        else "Unavailable",
+    )
+    result_columns[2].metric(
+        "Observed unique samples",
+        (
+            str(status.unique_samples)
+            if status.executed and status.unique_samples is not None
+            else "Unavailable"
+        ),
+    )
+    result_columns[3].metric(
+        "Selected sample probability",
+        (
+            f"{status.sample_probability:.6f}"
+            if status.executed and status.sample_probability is not None
+            else "Unavailable"
+        ),
+    )
     if status.valid:
         st.success(
-            f"Local Aer returned a feasible route from {demo.baseline_candidate_count} route variables."
+            f"Local Aer returned a route assignment that passed feasibility validation "
+            f"from {demo.baseline_candidate_count} route-selection variables."
         )
-        if status.sample_probability is not None and status.unique_samples is not None:
-            st.caption(
-                f"Observed sample probability: {status.sample_probability:.6f} | "
-                f"Unique samples: {status.unique_samples}"
-            )
     else:
         st.info(status.message)
+    if quantum_result is None:
+        st.info(
+            "QUBO energy, selected objective value, and decoded route details are unavailable "
+            "because no valid local QAOA result was returned."
+        )
+    else:
+        result_detail_columns = st.columns(3, gap="small")
+        result_detail_columns[0].metric(
+            "Selected sample QUBO energy",
+            f"{quantum_result.qubo_energy:.4f}",
+        )
+        result_detail_columns[1].metric(
+            "Selected objective value",
+            _format_money(quantum_result.objective_value),
+        )
+        result_detail_columns[2].metric(
+            "Validated route count",
+            len(run.quantum.routes) if run.quantum is not None else "Unavailable",
+        )
+        st.caption(
+            f"Returned result validity: {'valid' if quantum_result.is_valid else 'invalid'}; "
+            f"selected sample probability: {quantum_result.sample_probability:.6f}; "
+            f"{quantum_result.observed_unique_samples} unique measured samples were decoded."
+        )
+        if run.quantum is not None:
+            quantum_impact = calculate_route_impact(demo.scenario, run.quantum)
+            st.caption(
+                f"Validated route metrics: {quantum_impact.distance_km:.2f} km · "
+                f"{quantum_impact.travel_time_min:.1f} min · "
+                f"{_format_money(quantum_impact.cost)}."
+            )
     st.caption("This is a workflow demonstration, not evidence of quantum advantage.")
 
 
@@ -2053,8 +2193,12 @@ def _render_demo_objectives(demo: HackathonDemoResult) -> None:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption(
             "Objective comparisons use the existing classical optimizer. Physical values remain "
-            "separate from each dimensionless normalized objective score."
+            "separate from each dimensionless normalized objective score. The graph compares "
+            "the calculated classical routes; it does not compare QAOA results."
         )
+        objective_chart = _demo_objective_tradeoff_chart(demo.objective_results)
+        if objective_chart is not None:
+            st.altair_chart(objective_chart, width="stretch")
 
 
 def _render_demo_traffic(demo: HackathonDemoResult) -> None:
@@ -2086,6 +2230,11 @@ def _render_demo_traffic(demo: HackathonDemoResult) -> None:
             column.metric("Distance", f"{impact.distance_km:.2f} km")
             column.metric("Travel time", _format_duration(impact.travel_time_min))
             column.metric("Cost", _format_money(impact.cost))
+
+    traffic_chart = _demo_traffic_impact_chart(comparison.classical)
+    if traffic_chart is not None:
+        st.markdown("#### Simulated traffic impact · Classical optimizer")
+        st.altair_chart(traffic_chart, width="stretch")
 
     with st.expander("Traffic re-optimization map", expanded=False):
         _render_route_map(
@@ -3001,7 +3150,7 @@ def _benchmark_chart(
                 "Solver:N",
                 scale=alt.Scale(
                     domain=["Classical exact", "QAOA / Aer"],
-                    range=["#D6B15D", "#A0445C"],
+                    range=["#3B82F6", "#A78BFA"],
                 ),
                 legend=alt.Legend(orient="top"),
             ),
@@ -3019,15 +3168,232 @@ def _benchmark_chart(
         .configure(
             background="transparent",
             view={"stroke": "transparent"},
-            axis={
-                "labelColor": "#F2EBDD",
-                "titleColor": "#F2EBDD",
-                "gridColor": "#49353B",
-                "domainColor": "#76535C",
-                "tickColor": "#76535C",
-            },
-            legend={"labelColor": "#F2EBDD", "titleColor": "#F2EBDD"},
+            axis=_dashboard_chart_axis_style(),
+            legend={"labelColor": "#F1F5F9", "titleColor": "#F1F5F9"},
         )
+    )
+
+
+def _dashboard_chart_axis_style() -> dict[str, str]:
+    return {
+        "labelColor": "#A7B5C8",
+        "titleColor": "#F1F5F9",
+        "gridColor": "#263B55",
+        "domainColor": "#45627F",
+        "tickColor": "#45627F",
+    }
+
+
+def _metric_facet_chart(
+    rows: list[dict[str, object]],
+    *,
+    category_title: str,
+    color_title: str,
+    color_domain: list[str],
+    color_range: list[str],
+) -> alt.Chart | None:
+    if not rows:
+        return None
+    categories = list(dict.fromkeys(str(row["Category"]) for row in rows))
+    data = pd.DataFrame(rows)
+    base = (
+        alt.Chart(data)
+        .mark_bar(cornerRadiusEnd=3)
+        .encode(
+            x=alt.X(
+                "Value:Q",
+                title="Value (units shown per panel)",
+                axis=alt.Axis(format=",.2f"),
+            ),
+            y=alt.Y(
+                "Category:N",
+                title=category_title,
+                sort=categories,
+                axis=alt.Axis(labelLimit=240),
+            ),
+            color=alt.Color(
+                "Series:N",
+                title=color_title,
+                scale=alt.Scale(domain=color_domain, range=color_range),
+                legend=alt.Legend(orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("Category:N", title=category_title),
+                alt.Tooltip("Metric:N", title="Metric"),
+                alt.Tooltip("Value:Q", title="Value", format=",.3f"),
+                alt.Tooltip("Series:N", title=color_title),
+            ],
+        )
+        .properties(
+            width=210,
+            height=max(90, len(categories) * 32),
+        )
+    )
+    return (
+        base.facet(
+            column=alt.Column(
+                "Metric:N",
+                title=None,
+                header=alt.Header(
+                    labelColor="#F1F5F9",
+                    labelFontSize=12,
+                    labelLimit=240,
+                ),
+            ),
+            columns=3,
+        )
+        .resolve_scale(x="independent")
+        .configure(
+            background="transparent",
+            view={"stroke": "transparent"},
+            axis=_dashboard_chart_axis_style(),
+            legend={"labelColor": "#F1F5F9", "titleColor": "#F1F5F9"},
+        )
+    )
+
+
+def _custom_route_comparison_chart(
+    scored: tuple[CustomRouteScore, ...],
+    recommended_route_id: str | None,
+) -> alt.Chart | None:
+    rows: list[dict[str, object]] = []
+    for item in scored:
+        route_label = f"Route {item.route.returned_order}"
+        series = (
+            "Recommended"
+            if item.route.alternative_id == recommended_route_id
+            else "Alternative"
+        )
+        metrics: list[tuple[str, float | None]] = [
+            ("Distance (km)", item.route.distance_km),
+            ("OSRM estimated duration (min)", item.route.duration_min),
+            ("Estimated operating cost", item.operating_cost),
+            (
+                f"Estimated fuel ({item.fuel_unit})" if item.fuel_unit else "",
+                item.fuel_used,
+            ),
+            ("Tailpipe CO2 (kg)", item.tailpipe_co2_kg),
+        ]
+        for metric, value in metrics:
+            if metric and value is not None:
+                rows.append(
+                    {
+                        "Category": route_label,
+                        "Metric": metric,
+                        "Value": value,
+                        "Series": series,
+                    }
+                )
+    return _metric_facet_chart(
+        rows,
+        category_title="Returned OSRM route",
+        color_title="Route status",
+        color_domain=["Recommended", "Alternative"],
+        color_range=["#34D399", "#3B82F6"],
+    )
+
+
+def _selected_vehicle_sustainability_chart(
+    vehicle: dict[str, object],
+    selected: CustomRouteScore,
+) -> alt.Chart | None:
+    rows: list[dict[str, object]] = []
+    metrics: list[tuple[str, float | None]] = [
+        ("Uploaded capacity (units)", _float_or_none(vehicle.get("capacity"))),
+        (
+            f"Estimated fuel ({selected.fuel_unit})" if selected.fuel_unit else "",
+            selected.fuel_used,
+        ),
+        ("Estimated fuel cost (uploaded units)", selected.fuel_cost),
+        ("Estimated driver cost (uploaded units)", selected.driver_cost),
+        ("Estimated operating cost (uploaded units)", selected.operating_cost),
+        ("Estimated tailpipe CO2 (kg)", selected.tailpipe_co2_kg),
+    ]
+    for metric, value in metrics:
+        if metric and value is not None:
+            rows.append(
+                {
+                    "Category": str(vehicle["vehicle_id"]),
+                    "Metric": metric,
+                    "Value": value,
+                    "Series": "Selected vehicle / route",
+                }
+            )
+    return _metric_facet_chart(
+        rows,
+        category_title="Selected profile",
+        color_title="Data",
+        color_domain=["Selected vehicle / route"],
+        color_range=["#22D3EE"],
+    )
+
+
+def _float_or_none(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(float(value)):
+        return float(value)
+    return None
+
+
+def _demo_traffic_impact_chart(change) -> alt.Chart | None:
+    rows = []
+    for category, impact in (("Before", change.before), ("After", change.after)):
+        rows.extend(
+            (
+                {
+                    "Category": category,
+                    "Metric": "Estimated travel time (min)",
+                    "Value": impact.travel_time_min,
+                    "Series": category,
+                },
+                {
+                    "Category": category,
+                    "Metric": "Estimated route cost (₹)",
+                    "Value": cost_units_to_inr(impact.cost),
+                    "Series": category,
+                },
+            )
+        )
+    return _metric_facet_chart(
+        rows,
+        category_title="Simulated traffic stage",
+        color_title="Stage",
+        color_domain=["Before", "After"],
+        color_range=["#22D3EE", "#FBBF24"],
+    )
+
+
+def _demo_objective_tradeoff_chart(results) -> alt.Chart | None:
+    colors = {
+        "Cost Priority": "#3B82F6",
+        "Time Priority": "#22D3EE",
+        "Green Priority": "#34D399",
+        "Balanced": "#A78BFA",
+    }
+    rows: list[dict[str, object]] = []
+    for result in results:
+        objective = result.objective.value
+        impact = result.impact
+        for metric, value in (
+            ("Estimated route cost (₹)", cost_units_to_inr(impact.cost)),
+            ("Estimated travel time (min)", impact.travel_time_min),
+            ("Route distance (km)", impact.distance_km),
+            ("Estimated tailpipe CO2 (kg)", impact.tailpipe_co2_kg),
+        ):
+            if value is not None:
+                rows.append(
+                    {
+                        "Category": objective,
+                        "Metric": metric,
+                        "Value": value,
+                        "Series": objective,
+                    }
+                )
+    return _metric_facet_chart(
+        rows,
+        category_title="Classical objective result",
+        color_title="Objective · Classical optimizer",
+        color_domain=list(colors),
+        color_range=list(colors.values()),
     )
 
 
@@ -3049,3 +3415,820 @@ def _format_duration(minutes: float) -> str:
         hours += 1
         remainder = 0
     return f"{hours} h {remainder:02d} min" if hours else f"{remainder} min"
+
+
+def _render_custom_route_planner() -> None:
+    st.markdown("## Custom Route Planner / Route Explorer")
+    st.caption(
+        "Compare real point-to-point road alternatives returned by OSRM. "
+        "This is separate from the multi-delivery QUBO/QAOA optimizer."
+    )
+    st.info(
+        "Place searches send the query to OpenStreetMap Nominatim; route requests send "
+        "the selected coordinates to the public OSRM service. Uploaded fleet rows stay "
+        "in this Streamlit session and are not saved to SQLite or sent to those services."
+    )
+
+    selected_vehicle = _render_custom_fleet_profile()
+    st.markdown("### 1 / Choose locations")
+    origin_mode = st.radio(
+        "Origin selection",
+        ("Search for a place", "Use current location"),
+        horizontal=True,
+        key="custom_origin_mode",
+    )
+    previous_origin_mode = st.session_state.get("custom_origin_mode_seen")
+    if origin_mode == "Use current location" and previous_origin_mode != origin_mode:
+        st.session_state["custom_geolocation_generation"] = (
+            int(st.session_state.get("custom_geolocation_generation", 0)) + 1
+        )
+        existing_origin = st.session_state.get("custom_origin")
+        if isinstance(existing_origin, dict) and existing_origin.get("source") == "Browser geolocation":
+            st.session_state.pop("custom_origin", None)
+            st.session_state.pop("custom_route_result", None)
+    st.session_state["custom_origin_mode_seen"] = origin_mode
+    if origin_mode == "Use current location":
+        generation = int(st.session_state.get("custom_geolocation_generation", 0))
+        location = _browser_location_component(
+            key=f"custom_browser_location_{generation}",
+            default=None,
+        )
+        if isinstance(location, dict):
+            error = location.get("error")
+            if isinstance(error, str) and error:
+                st.warning(error)
+            else:
+                latitude, longitude = location.get("latitude"), location.get("longitude")
+                if (
+                    isinstance(latitude, (int, float))
+                    and isinstance(longitude, (int, float))
+                    and -90 <= latitude <= 90
+                    and -180 <= longitude <= 180
+                ):
+                    st.session_state["custom_origin"] = {
+                        "label": "Current location (browser permission)",
+                        "latitude": float(latitude),
+                        "longitude": float(longitude),
+                        "source": "Browser geolocation",
+                    }
+                    accuracy = location.get("accuracy")
+                    if isinstance(accuracy, (int, float)) and accuracy >= 0:
+                        st.caption(f"Browser-reported location accuracy: about {accuracy:.0f} m.")
+                else:
+                    st.warning("Browser returned invalid coordinates. Use manual place search.")
+    else:
+        _render_custom_place_search("origin")
+
+    _render_custom_place_search("destination")
+    origin = st.session_state.get("custom_origin")
+    destination = st.session_state.get("custom_destination")
+    origin_col, destination_col = st.columns(2)
+    with origin_col:
+        if isinstance(origin, dict):
+            st.success(f"**Origin:** {origin['label']}")
+            if st.button("Clear origin", key="custom_clear_origin"):
+                st.session_state.pop("custom_origin", None)
+                st.session_state["custom_geolocation_generation"] = (
+                    int(st.session_state.get("custom_geolocation_generation", 0)) + 1
+                )
+                st.session_state.pop("custom_route_result", None)
+                st.rerun()
+        else:
+            st.caption("Origin not selected.")
+    with destination_col:
+        if isinstance(destination, dict):
+            st.success(f"**Destination:** {destination['label']}")
+            if st.button("Clear destination", key="custom_clear_destination"):
+                st.session_state.pop("custom_destination", None)
+                st.session_state.pop("custom_route_result", None)
+                st.rerun()
+        else:
+            st.caption("Destination not selected.")
+
+    origin_coordinates = (
+        (origin["latitude"], origin["longitude"])
+        if isinstance(origin, dict)
+        else None
+    )
+    destination_coordinates = (
+        (destination["latitude"], destination["longitude"])
+        if isinstance(destination, dict)
+        else None
+    )
+    map_view_mode = "2D (Folium)"
+    if origin_coordinates is not None:
+        map_view_mode = st.radio(
+            "Map view",
+            ("2D (Folium)", "Tilted 3D (flat-map perspective)"),
+            horizontal=True,
+            key="custom_route_map_view",
+            help=(
+                "Tilted 3D uses a pitched camera over a flat map and real route geometry. "
+                "It does not add building heights, terrain, or elevation."
+            ),
+        )
+    route_map_slot = st.empty()
+    if origin_coordinates is not None:
+        _render_custom_location_map(
+            route_map_slot,
+            origin_coordinates,
+            destination_coordinates,
+            view_mode=map_view_mode,
+            origin_label=origin["label"],
+            destination_label=(
+                destination["label"] if isinstance(destination, dict) else "Destination"
+            ),
+        )
+
+    if origin_coordinates is None or destination_coordinates is None:
+        st.info("Select both an origin and destination before requesting road alternatives.")
+        return
+    if origin_coordinates == destination_coordinates:
+        st.warning("Origin and destination are the same location. Choose different places.")
+        return
+
+    st.markdown("### 2 / Compare provider-returned road routes")
+    fuel_type = selected_vehicle.get("fuel_type") if selected_vehicle else None
+    consumption = (
+        selected_vehicle.get("fuel_consumption_per_km")
+        if selected_vehicle
+        else None
+    )
+    fuel_price = selected_vehicle.get("fuel_price_per_unit") if selected_vehicle else None
+    driver_rate = (
+        selected_vehicle.get("driver_cost_per_hour")
+        if selected_vehicle
+        else None
+    )
+    max_speed = (
+        selected_vehicle.get("max_speed_kmph")
+        if selected_vehicle
+        else None
+    )
+    has_cost = (
+        canonical_fuel_type(fuel_type) is not None
+        and _custom_number(consumption, positive=True)
+        and _custom_number(fuel_price)
+        and _custom_number(driver_rate)
+    )
+    has_emissions = (
+        canonical_fuel_type(fuel_type) is not None
+        and _custom_number(consumption, positive=True)
+    )
+    objectives = custom_route_objectives(
+        has_estimated_cost=bool(has_cost),
+        has_emissions=bool(has_emissions),
+    )
+    if st.session_state.get("custom_route_objective") not in objectives:
+        st.session_state.pop("custom_route_objective", None)
+    objective = st.selectbox(
+        "Recommendation objective",
+        objectives,
+        key="custom_route_objective",
+        help=(
+            "The recommendation ranks only the alternatives actually returned by OSRM. "
+            "It does not invoke the QUBO/QAOA solver."
+        ),
+    )
+
+    cargo_demand = None
+    enforce_fuel = False
+    if selected_vehicle:
+        st.caption(
+            f"Selected vehicle: {selected_vehicle['vehicle_id']} · "
+            f"capacity {selected_vehicle['capacity']:g} (uploaded units). "
+            "This point-to-point view does not assign a multi-stop delivery plan."
+        )
+        if st.checkbox(
+            "Check an optional cargo demand against this vehicle's capacity",
+            key="custom_check_cargo_capacity",
+        ):
+            cargo_demand = st.number_input(
+                "Cargo demand (same units as uploaded capacity)",
+                min_value=0.001,
+                value=1.0,
+                step=0.5,
+                key="custom_cargo_demand",
+            )
+        available_fuel = selected_vehicle.get("available_fuel_quantity")
+        if _custom_number(available_fuel):
+            if has_emissions:
+                fuel_unit = FUEL_OPTIONS[fuel_type]["unit"]
+                st.caption(
+                    f"Available fuel in this row: {available_fuel:g} {fuel_unit}."
+                )
+                enforce_fuel = st.checkbox(
+                    "Enforce this vehicle's supplied available-fuel quantity",
+                    value=False,
+                    key="custom_enforce_available_fuel",
+                    help="Only enabled when available_fuel_quantity and fuel consumption data are supplied.",
+                )
+            else:
+                st.warning(
+                    "An available-fuel quantity was supplied, but this vehicle has no "
+                    "fuel type/consumption data. The app cannot check that constraint."
+                )
+    else:
+        st.caption(
+            "No company vehicle selected. Route distance/time can still be compared; "
+            "vehicle-dependent cost, fuel, emissions, and capacity checks remain unavailable."
+        )
+
+    if cargo_demand is not None and selected_vehicle:
+        if cargo_demand <= selected_vehicle["capacity"]:
+            st.success("The entered cargo demand fits the selected vehicle's stated capacity.")
+        else:
+            st.warning("The entered cargo demand exceeds the selected vehicle's stated capacity.")
+
+    request_key = (origin_coordinates, destination_coordinates)
+    if st.button(
+        "Compare OSRM road alternatives",
+        type="primary",
+        key="custom_compare_road_routes",
+    ):
+        try:
+            with st.spinner("Requesting road alternatives from OSRM..."):
+                alternatives, error = get_osrm_route_alternatives(
+                    origin_coordinates,
+                    destination_coordinates,
+                )
+            st.session_state["custom_route_result"] = {
+                "request_key": request_key,
+                "alternatives": alternatives,
+                "error": error,
+            }
+        except (ValueError, OSError) as error:
+            st.session_state["custom_route_result"] = {
+                "request_key": request_key,
+                "alternatives": (),
+                "error": str(error),
+            }
+
+    result = st.session_state.get("custom_route_result")
+    if not isinstance(result, dict) or result.get("request_key") != request_key:
+        st.caption(
+            "No route request has been made for the current locations/profile. "
+            "Press the button above to make one explicit request."
+        )
+        return
+    if result.get("error"):
+        st.warning(
+            f"OSRM road alternatives unavailable: {result['error']}. "
+            "No route recommendation is available."
+        )
+        return
+    alternatives = result.get("alternatives", ())
+    if not alternatives:
+        st.info(
+            "OSRM returned no road routes for these locations. No alternative or "
+            "recommendation has been invented."
+        )
+        return
+
+    try:
+        scored = score_custom_route_alternatives(
+            alternatives,
+            objective,
+            fuel_type=fuel_type,
+            fuel_consumption_per_km=consumption,
+            fuel_price_per_unit=fuel_price,
+            driver_cost_per_hour=driver_rate,
+            max_speed_kmph=max_speed,
+        )
+    except ValueError as error:
+        st.warning(f"Could not rank the returned routes: {error}")
+        return
+
+    fuel_eligible = tuple(
+        item
+        for item in scored
+        if not enforce_fuel
+        or item.fuel_used is None
+        or item.fuel_used <= float(selected_vehicle["available_fuel_quantity"])
+    )
+    recommended = fuel_eligible[0] if fuel_eligible else None
+    if enforce_fuel and recommended is None:
+        st.error(
+            "No returned route fits the selected vehicle's supplied available-fuel "
+            "quantity. The app will not recommend one as feasible."
+        )
+    elif len(scored) == 1:
+        st.info("OSRM returned one road route; no additional alternative was returned.")
+
+    ids = tuple(item.route.alternative_id for item in scored)
+    default_index = (
+        ids.index(recommended.route.alternative_id)
+        if recommended is not None
+        else 0
+    )
+    selected_key = "custom_selected_road_route_" + sha256(
+        repr(request_key).encode("utf-8")
+    ).hexdigest()[:10]
+    selected_id = st.selectbox(
+        "Selected road alternative",
+        ids,
+        index=default_index,
+        format_func=lambda alternative_id: _custom_route_label(
+            next(item for item in scored if item.route.alternative_id == alternative_id),
+            recommended,
+        ),
+        key=selected_key,
+    )
+    selected = next(item for item in scored if item.route.alternative_id == selected_id)
+    st.caption(
+        "Alternatives are limited to distinct routes returned by OSRM and its available "
+        "road network; they are not every physically possible route. OSRM duration is an "
+        "estimate, not live traffic, and does not account for confirmed live congestion, "
+        "tolls, road restrictions, or vehicle-specific road limits."
+    )
+    st.markdown("#### Returned route comparison")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Route": f"OSRM route {item.route.returned_order}",
+                    "Distance": f"{item.route.distance_km:.2f} km",
+                    "OSRM estimated time": _format_duration(item.route.duration_min),
+                    "Vehicle-adjusted time": (
+                        f"{_format_duration(item.estimated_time_min)} "
+                        "(maximum-speed constraint)"
+                        if item.vehicle_speed_adjusted
+                        else "Same as OSRM"
+                    ),
+                    "Fuel": (
+                        f"{item.fuel_used:.3f} {item.fuel_unit}"
+                        if item.fuel_used is not None and item.fuel_unit
+                        else "Not available"
+                    ),
+                    "Fuel cost (uploaded units)": (
+                        f"{item.fuel_cost:.2f}" if item.fuel_cost is not None else "Not available"
+                    ),
+                    "Driver cost (uploaded units)": (
+                        f"{item.driver_cost:.2f}"
+                        if item.driver_cost is not None
+                        else "Not available"
+                    ),
+                    "Estimated operating cost (uploaded currency/unit)": (
+                        f"{item.operating_cost:.2f} "
+                        f"{selected_vehicle.get('currency') or 'uploaded units'}"
+                        if item.operating_cost is not None
+                        else "Not available"
+                    ),
+                    "Tailpipe CO2": (
+                        f"{item.tailpipe_co2_kg:.3f} kg"
+                        if item.tailpipe_co2_kg is not None
+                        else "Not available"
+                    ),
+                    "Objective score (lower is better)": f"{item.normalized_score:.3f}",
+                    "Fuel check": (
+                        "Within supplied quantity"
+                        if enforce_fuel
+                        and item.fuel_used is not None
+                        and item.fuel_used <= float(selected_vehicle["available_fuel_quantity"])
+                        else "Exceeds supplied quantity"
+                        if enforce_fuel and item.fuel_used is not None
+                        else "Not enabled"
+                    ),
+                }
+                for item in scored
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(
+        "Scores are min-max normalized over the returned alternatives only; lower is better. "
+        "Balanced weights distance/time equally when no vehicle metrics are available; "
+        "when available it balances distance, time, estimated operating cost, and tailpipe "
+        "emissions. Equal metrics tie in that dimension."
+    )
+    route_chart = _custom_route_comparison_chart(
+        scored,
+        recommended.route.alternative_id if recommended is not None else None,
+    )
+    if route_chart is not None:
+        st.markdown("#### Returned-route metrics")
+        st.altair_chart(route_chart, width="stretch")
+        if len(scored) == 1:
+            st.caption("Only the single route returned by OSRM is shown; no alternatives were added.")
+    _render_custom_location_map(
+        route_map_slot,
+        origin_coordinates,
+        destination_coordinates,
+        scored,
+        selected_id,
+        recommended.route.alternative_id if recommended is not None else None,
+        recommended is not None,
+        view_mode=map_view_mode,
+        origin_label=origin["label"],
+        destination_label=destination["label"],
+    )
+    metric_columns = st.columns(3 if selected.vehicle_speed_adjusted else 2)
+    with metric_columns[0]:
+        st.metric("Selected route distance", f"{selected.route.distance_km:.2f} km")
+    with metric_columns[1]:
+        st.metric(
+            "OSRM estimated duration",
+            _format_duration(selected.route.duration_min),
+        )
+    if selected.vehicle_speed_adjusted:
+        with metric_columns[2]:
+            st.metric(
+                "Vehicle-adjusted time estimate",
+                _format_duration(selected.estimated_time_min),
+            )
+    if selected_vehicle is not None:
+        fleet_chart = _selected_vehicle_sustainability_chart(
+            selected_vehicle,
+            selected,
+        )
+        if fleet_chart is not None:
+            st.markdown("#### Selected vehicle / route metrics")
+            st.altair_chart(fleet_chart, width="stretch")
+            st.caption(
+                "This snapshot uses the selected uploaded vehicle and selected OSRM route. "
+                "Panels are omitted when a required input or calculated value is unavailable."
+            )
+    if recommended is not None:
+        st.info(
+            route_recommendation_explanation(
+                objective,
+                selected,
+                recommended,
+                len(scored),
+            )
+        )
+    if _custom_number(max_speed, positive=True):
+        st.caption(
+            f"Uploaded maximum speed: {max_speed:g} km/h. OSRM duration remains the "
+            "primary route estimate; when this constraint binds, the clearly labeled "
+            "vehicle-adjusted estimate is used for time ranking and driver-cost estimates. "
+            "Neither estimate represents live traffic."
+        )
+    st.caption(
+        "This point-to-point comparison uses OSRM route alternatives and uploaded per-vehicle "
+        "fields where supplied. It does not invoke classical multi-delivery optimization, "
+        "QUBO, QAOA, or IBM Quantum."
+    )
+
+
+def _render_custom_location_map(
+    map_slot,
+    origin: tuple[float, float],
+    destination: tuple[float, float] | None,
+    alternatives=(),
+    selected_alternative_id: str | None = None,
+    recommended_alternative_id: str | None = None,
+    recommendation_available: bool = True,
+    *,
+    view_mode: str = "2D (Folium)",
+    origin_label: str = "Origin",
+    destination_label: str = "Destination",
+) -> None:
+    map_slot.empty()
+    with map_slot.container():
+        st.markdown("#### Selected locations and road alternatives")
+        if view_mode == "Tilted 3D (flat-map perspective)":
+            tilted_map = build_custom_route_tilted_map(
+                origin,
+                destination,
+                alternatives,
+                selected_alternative_id,
+                recommended_alternative_id,
+                recommendation_available,
+                origin_label,
+                destination_label,
+            )
+            map_key = sha256(
+                repr(
+                    (
+                        origin,
+                        destination,
+                        tuple(
+                            item.route.alternative_id
+                            for item in alternatives
+                        ),
+                        selected_alternative_id,
+                        recommended_alternative_id,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()[:12]
+            st.pydeck_chart(
+                tilted_map,
+                height=480,
+                width="stretch",
+                key=f"custom_route_tilted_map_{map_key}",
+            )
+            st.caption(
+                "Tilted 3D is a camera-pitched perspective over a flat map: routes and "
+                "locations use actual OSRM geometry and selected coordinates, with no "
+                "invented elevation, terrain, or buildings. The dark basemap is supplied "
+                "by CARTO without an API token; its map style/tiles require internet access "
+                "and remain subject to the provider's usage policy."
+            )
+        else:
+            route_map = build_custom_route_map(
+                origin,
+                destination,
+                alternatives,
+                selected_alternative_id,
+                recommended_alternative_id,
+                recommendation_available,
+            )
+            st_folium(route_map, height=480, use_container_width=True, returned_objects=[])
+            st.caption(
+                "The standard 2D Folium / OpenStreetMap view remains available as the "
+                "default map and fallback."
+            )
+        if alternatives:
+            st.caption(
+                "Cyan, blue, and purple distinguish OSRM-returned alternatives. The "
+                "recommended route is solid and thickest; other routes are dashed, and a "
+                "selected non-recommended route is also emphasized."
+            )
+        else:
+            st.caption(
+                "Selected locations appear here without requesting a route. The map updates "
+                "when either location changes."
+            )
+
+
+def _render_custom_place_search(field: str) -> None:
+    title = "Origin" if field == "origin" else "Destination"
+    with st.form(f"custom_{field}_search_form"):
+        query = st.text_input(
+            f"Search {field} by place, locality, or address",
+            key=f"custom_{field}_query",
+            placeholder="Enter any supported place or address",
+        )
+        submitted = st.form_submit_button(f"Search {field}")
+    if submitted:
+        st.session_state.pop(f"custom_{field}", None)
+        places, error = search_places(query)
+        st.session_state[f"custom_{field}_search_results"] = places
+        st.session_state[f"custom_{field}_search_error"] = error
+        st.session_state.pop("custom_route_result", None)
+    error = st.session_state.get(f"custom_{field}_search_error")
+    if error:
+        st.warning(error)
+    places = st.session_state.get(f"custom_{field}_search_results", ())
+    if places:
+        selection = st.selectbox(
+            f"Matching {field} places",
+            range(len(places)),
+            format_func=lambda index: places[index].display_name,
+            key=f"custom_{field}_place_selection",
+        )
+        chosen: PlaceResult = places[selection]
+        st.session_state[f"custom_{field}"] = {
+            "label": chosen.display_name,
+            "latitude": chosen.latitude,
+            "longitude": chosen.longitude,
+            "source": "OpenStreetMap Nominatim",
+        }
+    elif submitted and not error:
+        st.info(f"No matching {title.lower()} was returned. Try a more specific search.")
+
+
+def _render_custom_fleet_profile() -> dict[str, object] | None:
+    with st.expander("Fleet Data / Company Profile (optional)", expanded=False):
+        st.caption(
+            "Required: vehicle_id and capacity. Optional: company_id, vehicle_type, "
+            "max_speed_kmph, available, fuel_type, fuel_consumption_per_km, "
+            "fuel_price_per_unit, currency, driver_cost_per_hour, shift_start_min, "
+            "shift_end_min, and available_fuel_quantity. Unsupported columns are rejected. "
+            "Data stays in this Streamlit session; it is not persisted to SQLite or sent "
+            "to Nominatim/OSRM."
+        )
+        st.caption(
+            "Capacity is used only for the optional cargo check; max_speed_kmph can raise "
+            "the clearly labeled vehicle-adjusted time estimate; available=false excludes "
+            "a vehicle from selection; fuel and cost fields are used only when their required "
+            "inputs are present. Shift fields are displayed but not checked against a route "
+            "because this planner has no departure schedule."
+        )
+        st.caption(
+            "Supported fuel types: Diesel, Gasoline (Petrol is a gasoline alias), and Electric. "
+            "CNG and LPG are not supported because per-unit consumption and emissions factors "
+            "are not configured. Electric fuel cost uses uploaded kWh/km and uploaded cost/kWh; "
+            "only tailpipe CO2 is shown, not grid emissions."
+        )
+        st.download_button(
+            "Download blank fleet CSV template",
+            data=FLEET_TEMPLATE_CSV,
+            file_name="quantumroute-fleet-template.csv",
+            mime="text/csv",
+            key="custom_fleet_template_download",
+        )
+        generation = int(st.session_state.get("custom_fleet_upload_generation", 0))
+        uploaded = st.file_uploader(
+            "Upload company fleet data (.csv or .xlsx)",
+            type=("csv", "xlsx"),
+            max_upload_size=5,
+            key=f"custom_fleet_upload_{generation}",
+        )
+
+        if st.button("Clear session fleet profile", key="custom_fleet_clear"):
+            st.session_state["custom_fleet_upload_generation"] = generation + 1
+            st.session_state.pop("custom_fleet_rows", None)
+            st.session_state.pop("custom_fleet_validation", None)
+            st.session_state.pop("custom_fleet_upload_fingerprint", None)
+            st.session_state.pop("custom_fleet_accepted_fingerprint", None)
+            st.session_state.pop("custom_route_result", None)
+            st.rerun()
+
+        if uploaded is not None:
+            content = uploaded.getvalue()
+            fingerprint = sha256(content).hexdigest()
+            if st.session_state.get("custom_fleet_upload_fingerprint") != fingerprint:
+                st.session_state["custom_fleet_upload_fingerprint"] = fingerprint
+                st.session_state.pop("custom_fleet_rows", None)
+                st.session_state.pop("custom_fleet_accepted_fingerprint", None)
+                st.session_state["custom_fleet_validation"] = validate_fleet_upload(
+                    uploaded.name,
+                    content,
+                )
+            validation = st.session_state["custom_fleet_validation"]
+            st.markdown("#### Uploaded data preview")
+            if validation.preview_rows:
+                st.dataframe(
+                    pd.DataFrame(
+                        validation.preview_rows,
+                        columns=validation.columns,
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+            else:
+                st.info("The uploaded file has no readable data rows to preview.")
+            if validation.errors:
+                st.session_state.pop("custom_fleet_rows", None)
+                st.error("Fleet file needs correction and has not been accepted:")
+                for message in validation.errors:
+                    st.write(f"- {message}")
+                return None
+            if (
+                st.session_state.get("custom_fleet_accepted_fingerprint")
+                != fingerprint
+            ):
+                st.warning(
+                    f"Previewing {len(validation.rows)} valid vehicle row(s). "
+                    "Review the data, then explicitly accept it for this session."
+                )
+                if st.button(
+                    "Accept uploaded fleet data",
+                    type="primary",
+                    key=f"custom_fleet_accept_{fingerprint[:12]}",
+                ):
+                    st.session_state["custom_fleet_rows"] = validation.rows
+                    st.session_state["custom_fleet_accepted_fingerprint"] = fingerprint
+            if (
+                st.session_state.get("custom_fleet_accepted_fingerprint")
+                == fingerprint
+            ):
+                st.session_state["custom_fleet_rows"] = validation.rows
+                st.success(
+                    f"Accepted {len(validation.rows)} vehicle row(s) for this session. "
+                    "No uploaded company data was persisted or transmitted."
+                )
+            missing_optional = [
+                f"{field} ({sum(row.get(field) is None for row in validation.rows)} "
+                f"of {len(validation.rows)} row(s))"
+                for field in FLEET_TEMPLATE_COLUMNS
+                if field not in REQUIRED_FLEET_COLUMNS
+                and any(row.get(field) is None for row in validation.rows)
+            ]
+            if missing_optional:
+                st.info(
+                    "Optional fields missing or blank: "
+                    + ", ".join(missing_optional)
+                    + ". No missing values are inferred; affected vehicle estimates "
+                    "remain unavailable."
+                )
+        rows = st.session_state.get("custom_fleet_rows", ())
+        if not rows:
+            st.caption(
+                "No accepted fleet profile is active. Route distance/time comparison "
+                "remains available without fleet data."
+            )
+            return None
+
+        profiles: dict[str, list[dict[str, object]]] = {}
+        for row in rows:
+            profile_id = str(
+                row.get("company_id") or "Unspecified company/fleet (company_id blank)"
+            )
+            profiles.setdefault(profile_id, []).append(row)
+        profile_ids = tuple(profiles)
+        selected_profile = st.selectbox(
+            "Company / fleet profile",
+            profile_ids,
+            key=f"custom_fleet_profile_{st.session_state.get('custom_fleet_accepted_fingerprint', '')[:12]}",
+        )
+        profile_rows = profiles[selected_profile]
+        selectable_rows = [row for row in profile_rows if row.get("available") is not False]
+        excluded_count = len(profile_rows) - len(selectable_rows)
+        if excluded_count:
+            st.info(
+                f"{excluded_count} vehicle(s) explicitly marked unavailable are excluded."
+            )
+        if not selectable_rows:
+            st.warning("No selectable vehicles remain in this fleet profile.")
+            return None
+        rows_by_id = {str(row["vehicle_id"]): row for row in selectable_rows}
+        vehicle_ids = tuple(rows_by_id)
+        selected_id = st.selectbox(
+            "Vehicle for estimates and supported checks",
+            vehicle_ids,
+            format_func=lambda vehicle_id: _custom_fleet_vehicle_label(
+                rows_by_id[vehicle_id]
+            ),
+            key=(
+                f"custom_fleet_vehicle_{st.session_state.get('custom_fleet_accepted_fingerprint', '')[:12]}_"
+                f"{sha256(selected_profile.encode('utf-8')).hexdigest()[:8]}"
+            ),
+        )
+        selected_vehicle = rows_by_id[selected_id]
+        _render_custom_fuel_profile_details(selected_vehicle)
+        availability = selected_vehicle.get("available")
+        if availability is None:
+            st.warning(
+                "Availability was not supplied for this vehicle; its operational "
+                "availability is unknown."
+            )
+        shift_start = selected_vehicle.get("shift_start_min")
+        shift_end = selected_vehicle.get("shift_end_min")
+        if shift_start is not None or shift_end is not None:
+            shift_label = (
+                f"{_format_time(shift_start) if shift_start is not None else 'not supplied'}"
+                f"–{_format_time(shift_end) if shift_end is not None else 'not supplied'}"
+            )
+            st.caption(
+                f"Uploaded driver shift: {shift_label}. This is profile information, "
+                "not a route feasibility check."
+            )
+        return selected_vehicle
+
+
+def _render_custom_fuel_profile_details(vehicle: dict[str, object]) -> None:
+    selected_fuel_type = vehicle.get("fuel_type")
+    canonical_type = canonical_fuel_type(
+        str(selected_fuel_type) if selected_fuel_type is not None else None
+    )
+    if canonical_type is None:
+        return
+    fuel_spec = FUEL_OPTIONS[canonical_type]
+    if selected_fuel_type == "Petrol":
+        st.caption(
+            "Uploaded fuel type: Petrol (calculated using the Gasoline model); "
+            f"consumption is in {fuel_spec['unit']}/km and fuel price is per "
+            f"{fuel_spec['unit']}."
+        )
+    elif canonical_type == "Electric":
+        st.caption(
+            "Uploaded fuel type: Electric; consumption is in kWh/km and the "
+            "uploaded fuel price is per kWh. Emissions are tailpipe-only: zero "
+            "tailpipe CO2 is not a grid-emissions or lifecycle estimate; grid "
+            "emissions are unavailable because no electricity factor is supplied."
+        )
+    else:
+        st.caption(
+            f"Uploaded fuel type: {canonical_type}; consumption is in "
+            f"{fuel_spec['unit']}/km and fuel price is per {fuel_spec['unit']}. "
+            "Tailpipe CO2 uses the configured fuel factor."
+        )
+
+
+def _custom_fleet_vehicle_label(row: dict[str, object]) -> str:
+    vehicle_type = row.get("vehicle_type")
+    label = str(row["vehicle_id"])
+    if vehicle_type:
+        label += f" · {vehicle_type}"
+    if row.get("available") is True:
+        label += " · Available"
+    elif row.get("available") is None:
+        label += " · Availability unknown"
+    return label
+
+
+def _custom_number(value: object, *, positive: bool = False) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and isfinite(float(value))
+        and (float(value) > 0 if positive else float(value) >= 0)
+    )
+
+
+def _custom_route_label(
+    item,
+    recommended,
+) -> str:
+    label = (
+        f"OSRM route {item.route.returned_order} · "
+        f"{item.route.distance_km:.2f} km · "
+        f"{_format_duration(item.route.duration_min)}"
+    )
+    if recommended and item.route.alternative_id == recommended.route.alternative_id:
+        label += " · Recommended"
+    return label

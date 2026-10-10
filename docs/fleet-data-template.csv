@@ -1,0 +1,1 @@
+company_id,vehicle_id,vehicle_type,capacity,max_speed_kmph,available,fuel_type,fuel_consumption_per_km,fuel_price_per_unit,currency,driver_cost_per_hour,shift_start_min,shift_end_min,available_fuel_quantity

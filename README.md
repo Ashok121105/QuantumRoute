@@ -24,6 +24,15 @@ See the [official six-slide Qiskit Fall Fest submission](docs/QuantumRoute_Qiski
 [slide source](docs/hackathon-presentation.md). No IBM hardware job is needed
 for this walkthrough.
 
+The separate **Custom Route Planner** supports explicit browser location
+permission or OpenStreetMap place search, OSRM point-to-point road alternatives,
+and session-only CSV/XLSX fleet profiles. See the
+[custom route planner guide](docs/custom-route-planner.md) and download the
+[blank fleet CSV template](docs/fleet-data-template.csv). Place queries and
+route coordinates are sent to public OpenStreetMap services only after the
+corresponding search or route request is submitted; uploaded fleet rows are not
+persisted to operation history.
+
 ## Architecture
 
 ```mermaid
@@ -581,6 +590,7 @@ python -m unittest discover -s tests -v
 - IBM Quantum and IBM Quantum Runtime: [IBM Quantum platform](https://quantum.ibm.com/)
 	and the [Qiskit Runtime repository](https://github.com/Qiskit/qiskit-ibm-runtime).
 - OpenStreetMap, for map tiles when displayed: [copyright and attribution](https://www.openstreetmap.org/copyright).
+- CARTO, for the optional tilted-map dark basemap: [basemap documentation and usage](https://carto.com/basemaps/).
 - OSRM, for optional road-routing tables and route geometry:
 	[project site](https://project-osrm.org/).
 

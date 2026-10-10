@@ -122,6 +122,101 @@ class IBMHardwareComparisonUITests(unittest.TestCase):
         submit.assert_not_called()
         refresh.assert_not_called()
 
+    def test_demo_workflow_overview_and_execution_facts_are_actual_local_aer_values(self) -> None:
+        with (
+            patch.object(ui, "connect_ibm_quantum") as connect,
+            patch.object(ui, "discover_ibm_backends") as discover,
+            patch.object(ui, "submit_confirmed_hardware_job") as submit,
+            patch.object(ui, "refresh_hardware_job_status") as refresh,
+        ):
+            app = self._render_demo(self.demo_result)
+
+        self.assertFalse(app.exception, [str(item.value) for item in app.exception])
+        visible = self._visible_text(app)
+        for stage in (
+            "Workflow overview",
+            "not a live execution trace",
+            "Delivery inputs and constraints",
+            "Classical feasibility",
+            "QUBO formulation",
+            "QAOA",
+            "Qiskit Aer simulation",
+            "Candidate decoding",
+            "Feasibility validation",
+            "Route results",
+            "not IBM hardware execution",
+            "separate from the IBM Quantum Hardware workspace",
+            "not evidence of quantum advantage",
+        ):
+            self.assertIn(stage, visible)
+
+        metrics = {item.label: str(item.value) for item in app.metric}
+        self.assertEqual(
+            metrics["Feasible route options / QUBO variables"],
+            str(self.demo_result.baseline_candidate_count),
+        )
+        self.assertEqual(
+            metrics["Feasibility validation"],
+            "Passed" if self.demo_result.baseline_qaoa.valid else "Not passed",
+        )
+        self.assertEqual(
+            metrics["Observed unique samples"],
+            str(self.demo_result.baseline_qaoa.unique_samples),
+        )
+        self.assertEqual(
+            metrics["Selected sample probability"],
+            f"{self.demo_result.baseline_qaoa.sample_probability:.6f}",
+        )
+        result = self.demo_result.baseline_run.quantum_result
+        self.assertIsNotNone(result)
+        self.assertIn(f"{result.qubo_energy:.4f}", visible)
+        self.assertIn(ui._format_money(result.objective_value), visible)
+        self.assertIn(str(result.observed_unique_samples), visible)
+
+        connect.assert_not_called()
+        discover.assert_not_called()
+        submit.assert_not_called()
+        refresh.assert_not_called()
+
+    def test_demo_workflow_shows_unavailable_values_when_local_aer_was_skipped(self) -> None:
+        unavailable_demo = replace(
+            self.demo_result,
+            baseline_run=replace(
+                self.demo_result.baseline_run,
+                quantum=None,
+                quantum_result=None,
+            ),
+            baseline_qaoa=replace(
+                self.demo_result.baseline_qaoa,
+                executed=False,
+                valid=False,
+                message="Local QAOA was skipped.",
+                sample_probability=None,
+                unique_samples=None,
+            ),
+        )
+        with (
+            patch.object(ui, "connect_ibm_quantum") as connect,
+            patch.object(ui, "discover_ibm_backends") as discover,
+            patch.object(ui, "submit_confirmed_hardware_job") as submit,
+            patch.object(ui, "refresh_hardware_job_status") as refresh,
+        ):
+            app = self._render_demo(unavailable_demo)
+
+        self.assertFalse(app.exception, [str(item.value) for item in app.exception])
+        metrics = {item.label: str(item.value) for item in app.metric}
+        self.assertEqual(metrics["Feasibility validation"], "Unavailable")
+        self.assertEqual(metrics["Observed unique samples"], "Unavailable")
+        self.assertEqual(metrics["Selected sample probability"], "Unavailable")
+        self.assertIn(
+            "QUBO energy, selected objective value, and decoded route details are unavailable",
+            self._visible_text(app),
+        )
+        connect.assert_not_called()
+        discover.assert_not_called()
+        submit.assert_not_called()
+        refresh.assert_not_called()
+
     def test_hardware_metrics_are_computed_from_stored_decoded_routes(self) -> None:
         app = self._render_demo(self.demo_result, self.job_state, self.dry_run)
         self.assertFalse(app.exception, [str(item.value) for item in app.exception])
@@ -226,8 +321,9 @@ class IBMHardwareComparisonUITests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         for required in (
             "QUBO formulation",
-            "Local simulation",
-            "Decode + validate",
+            "Qiskit Aer simulation",
+            "Candidate decoding",
+            "Feasibility validation",
             "QuantumRoute — From Classical Routing to Real Quantum Hardware",
             "IBM Quantum hardware",
             "Sustainability analysis",

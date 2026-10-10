@@ -22,8 +22,8 @@ from .routing import (
 from .scenario import FUEL_OPTIONS, ScenarioProblem
 
 
-ROUTE_COLORS = ("#922D49", "#B48632", "#34775A", "#65558E", "#237A7A")
-ROAD_ALTERNATIVE_COLORS = ("#0072B2", "#D55E00", "#009E73")
+ROUTE_COLORS = ("#3B82F6", "#A78BFA", "#22D3EE", "#34D399", "#60A5FA")
+ROAD_ALTERNATIVE_COLORS = ("#22D3EE", "#3B82F6", "#A78BFA")
 
 
 @dataclass(frozen=True)
@@ -107,10 +107,10 @@ def build_route_map(
     folium.CircleMarker(
         depot,
         radius=10,
-        color="#17324d",
+        color="#22D3EE",
         weight=2,
         fill=True,
-        fill_color="#17324d",
+        fill_color="#101D30",
         fill_opacity=1.0,
         tooltip=f"Depot | {escape(scenario.location_names['depot'])}",
     ).add_to(route_map)
@@ -121,10 +121,10 @@ def build_route_map(
         folium.CircleMarker(
             coordinate,
             radius=7,
-            color="#263238",
+            color="#A78BFA",
             weight=2,
             fill=True,
-            fill_color="#f4a261",
+            fill_color="#A78BFA",
             fill_opacity=0.95,
             tooltip=destination_name,
             popup=(
@@ -245,20 +245,20 @@ def _add_road_alternative_layers(
     folium.CircleMarker(
         selected_geometry[0],
         radius=7,
-        color="#f0e442",
+        color="#22D3EE",
         weight=3,
         fill=True,
-        fill_color="#0072B2",
+        fill_color="#3B82F6",
         fill_opacity=1.0,
         tooltip="Selected road leg start",
     ).add_to(endpoint_group)
     folium.CircleMarker(
         selected_geometry[-1],
         radius=7,
-        color="#f0e442",
+        color="#22D3EE",
         weight=3,
         fill=True,
-        fill_color="#D55E00",
+        fill_color="#A78BFA",
         fill_opacity=1.0,
         tooltip="Selected road leg end",
     ).add_to(endpoint_group)
@@ -308,8 +308,8 @@ def _add_road_alternative_layers(
 
     legend = (
         '<div style="position:fixed;bottom:28px;left:28px;z-index:9999;'
-        "background:rgba(20,30,42,.94);color:#f3f6fa;padding:10px 12px;"
-        'border:1px solid #7f93a8;border-radius:6px;font-size:12px">'
+        "background:rgba(16,29,48,.96);color:#F1F5F9;padding:10px 12px;"
+        'border:1px solid #45627F;border-radius:8px;font-size:12px">'
         "<strong>OSRM road alternatives</strong><ul style=\"padding-left:8px;"
         f'margin:6px 0 0;list-style:none">{"".join(legend_items)}</ul></div>'
     )

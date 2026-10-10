@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        color: #f1f5f9;
+      }
+      body {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        margin: 0;
+        background: transparent;
+        color: #f1f5f9;
+      }
+      button {
+        min-height: 40px;
+        border: 1px solid #22d3ee;
+        border-radius: 9px;
+        background: #14243a;
+        color: #f1f5f9;
+        padding: 9px 14px;
+        font: inherit;
+        font-weight: 650;
+        cursor: pointer;
+      }
+      button:hover { background: #1c3450; }
+      button:focus-visible { outline: 2px solid #3b82f6; outline-offset: 2px; }
+      button:disabled { cursor: wait; opacity: .75; }
+      #status {
+        flex: 1 1 220px;
+        font-size: 13px;
+        line-height: 1.45;
+        color: #a7b5c8;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="location" type="button">Use My Current Location</button>
+    <span id="status" aria-live="polite">Your browser will ask permission after you click.</span>
+    <script src="./geolocation.js"></script>
+  </body>
+</html>

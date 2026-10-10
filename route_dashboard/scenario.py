@@ -34,7 +34,24 @@ FUEL_OPTIONS = {
         "tailpipe_co2_kg_per_unit": 0.0,
     },
 }
+FUEL_TYPE_ALIASES = {"Petrol": "Gasoline"}
 MAX_DASHBOARD_DELIVERIES = 5
+
+
+def canonical_fuel_type(fuel_type: str | None) -> str | None:
+    """Resolve supported display names and aliases to their calculation model."""
+    if fuel_type is None:
+        return None
+    cleaned = fuel_type.strip().casefold()
+    if not cleaned:
+        return None
+    for supported_type in FUEL_OPTIONS:
+        if supported_type.casefold() == cleaned:
+            return supported_type
+    for alias, supported_type in FUEL_TYPE_ALIASES.items():
+        if alias.casefold() == cleaned:
+            return supported_type
+    return None
 
 
 @dataclass(frozen=True)
