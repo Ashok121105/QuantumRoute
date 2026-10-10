@@ -23,6 +23,24 @@ from .scenario import FUEL_OPTIONS, ScenarioProblem
 
 
 ROUTE_COLORS = ("#3B82F6", "#A78BFA", "#22D3EE", "#34D399", "#60A5FA")
+VEHICLE_COLORS = (
+    "#60A5FA",
+    "#FDBA74",
+    "#5EEAD4",
+    "#F9A8D4",
+    "#BEF264",
+    "#FDE047",
+    "#C4B5FD",
+    "#FDA4AF",
+)
+OPTIMIZED_SEGMENT_COLORS = (
+    "#F87171",
+    "#FBBF24",
+    "#60A5FA",
+    "#C084FC",
+    "#FB923C",
+    "#2DD4BF",
+)
 ROAD_ALTERNATIVE_COLORS = ("#22D3EE", "#3B82F6", "#A78BFA")
 
 
@@ -140,6 +158,7 @@ def build_route_map(
     road_alternatives: tuple[ScoredRoadAlternative, ...] = (),
     selected_road_alternative_id: str | None = None,
     show_road_alternatives: bool = True,
+    show_optimized_order: bool = False,
 ) -> RouteMapView:
     depot = scenario.coordinates["depot"]
     route_map = folium.Map(
@@ -159,25 +178,26 @@ def build_route_map(
         tooltip=f"Depot | {escape(scenario.location_names['depot'])}",
     ).add_to(route_map)
 
-    for delivery in scenario.deliveries:
-        coordinate = scenario.coordinates[delivery.location]
-        destination_name = escape(scenario.location_names[delivery.location])
-        folium.CircleMarker(
-            coordinate,
-            radius=7,
-            color="#A78BFA",
-            weight=2,
-            fill=True,
-            fill_color="#A78BFA",
-            fill_opacity=0.95,
-            tooltip=destination_name,
-            popup=(
-                f"{destination_name}<br>"
-                f"Demand: {delivery.demand:g}<br>"
-                f"Window: {_format_time(delivery.window_start_min)}-"
-                f"{_format_time(delivery.window_end_min)}"
-            ),
-        ).add_to(route_map)
+    if not show_optimized_order:
+        for delivery in scenario.deliveries:
+            coordinate = scenario.coordinates[delivery.location]
+            destination_name = escape(scenario.location_names[delivery.location])
+            folium.CircleMarker(
+                coordinate,
+                radius=7,
+                color="#A78BFA",
+                weight=2,
+                fill=True,
+                fill_color="#A78BFA",
+                fill_opacity=0.95,
+                tooltip=destination_name,
+                popup=(
+                    f"{destination_name}<br>"
+                    f"Demand: {delivery.demand:g}<br>"
+                    f"Window: {_format_time(delivery.window_start_min)}-"
+                    f"{_format_time(delivery.window_end_min)}"
+                ),
+            ).add_to(route_map)
 
     route_groups: list[tuple[str, RouteSummary, ScenarioProblem, bool]] = []
     if traffic_comparison and traffic_comparison.after_run is not None:
@@ -194,20 +214,163 @@ def build_route_map(
 
     geometry_modes: list[bool] = []
     geometry_errors: list[str] = []
+    optimized_leg_count = 0
+    optimized_geometry_count = 0
+    optimized_legend_items: list[str] = []
+    optimized_bounds: list[tuple[float, float]] = []
     for label, summary, route_scenario, is_before in route_groups:
         feature_group = folium.FeatureGroup(name=label, show=True)
         for index, route in enumerate(summary.routes):
             color = ROUTE_COLORS[index % len(ROUTE_COLORS)]
+            vehicle_map = {
+                vehicle.vehicle_id: vehicle for vehicle in route_scenario.vehicles
+            }
+            vehicle = vehicle_map[route.plan.vehicle_id]
+            vehicle_order = sorted(vehicle_map)
+            vehicle_color = VEHICLE_COLORS[
+                vehicle_order.index(route.plan.vehicle_id) % len(VEHICLE_COLORS)
+            ]
+            delivery_map = {
+                delivery.delivery_id: delivery
+                for delivery in route_scenario.deliveries
+            }
+            route_origin = route_scenario.coordinates[vehicle.start_location]
+            route_destination = route_scenario.coordinates[vehicle.end_location]
             requested_coordinates = tuple(
-                [depot]
+                [route_origin]
                 + [
-                    route_scenario.coordinates[delivery_id]
+                    route_scenario.coordinates[delivery_map[delivery_id].location]
                     for delivery_id in route.plan.delivery_ids
                 ]
-                + [depot]
+                + [route_destination]
             )
             route_coordinates = requested_coordinates
             used_osrm_geometry = False
+            if show_optimized_order:
+                ordered_location_ids = (
+                    vehicle.start_location,
+                    *(
+                        delivery_map[delivery_id].location
+                        for delivery_id in route.plan.delivery_ids
+                    ),
+                    vehicle.end_location,
+                )
+                ordered_names = tuple(
+                    route_scenario.location_names[location_id]
+                    for location_id in ordered_location_ids
+                )
+                ordered_coordinates = tuple(
+                    route_scenario.coordinates[location_id]
+                    for location_id in ordered_location_ids
+                )
+                optimized_bounds.extend(ordered_coordinates)
+                optimized_legend_items.append(
+                    '<span style="display:inline-block;width:12px;height:12px;'
+                    f"border:2px solid {vehicle_color};border-radius:50%;"
+                    'vertical-align:middle;margin-right:5px"></span>'
+                    f"<strong>{escape(label)} · {escape(route.plan.vehicle_id)}</strong>"
+                )
+                for stop_number, delivery_id in enumerate(
+                    route.plan.delivery_ids, start=1
+                ):
+                    delivery = delivery_map[delivery_id]
+                    destination_name = escape(
+                        route_scenario.location_names[delivery.location]
+                    )
+                    folium.Marker(
+                        route_scenario.coordinates[delivery.location],
+                        tooltip=(
+                            f"Stop {stop_number} | {destination_name} | "
+                            f"{escape(route.plan.vehicle_id)}"
+                        ),
+                        popup=folium.Popup(
+                            f"Stop {stop_number} — {destination_name}<br>"
+                            f"Vehicle: {escape(route.plan.vehicle_id)}<br>"
+                            f"Demand: {delivery.demand:g}<br>"
+                            f"Window: {_format_time(delivery.window_start_min)}-"
+                            f"{_format_time(delivery.window_end_min)}",
+                            max_width=280,
+                        ),
+                        icon=folium.DivIcon(
+                            html=(
+                                '<div style="background:#151014;color:#F3E9DA;'
+                                f"border:2px solid {vehicle_color};"
+                                "border-radius:50%;width:30px;height:30px;"
+                                "display:flex;align-items:center;justify-content:center;"
+                                'font-weight:700;font-size:12px">'
+                                f"{stop_number}</div>"
+                            ),
+                            icon_size=(30, 30),
+                            icon_anchor=(15, 15),
+                        ),
+                    ).add_to(feature_group)
+                    optimized_legend_items.append(
+                        f"Stop {stop_number} — {destination_name}"
+                    )
+
+                for leg_index, (start_id, end_id) in enumerate(
+                    zip(ordered_location_ids, ordered_location_ids[1:]),
+                    start=1,
+                ):
+                    optimized_leg_count += 1
+                    leg_coordinates = (
+                        route_scenario.coordinates[start_id],
+                        route_scenario.coordinates[end_id],
+                    )
+                    road_geometry, geometry_error = get_osrm_route_geometry(
+                        leg_coordinates
+                    )
+                    if road_geometry is None:
+                        if geometry_error:
+                            geometry_errors.append(geometry_error)
+                        optimized_legend_items.append(
+                            f'<span style="color:#F3E9DA">Segment {leg_index} — '
+                            f"{escape(ordered_names[leg_index - 1])} → "
+                            f"{escape(ordered_names[leg_index])} "
+                            "(road geometry unavailable)</span>"
+                        )
+                        continue
+
+                    optimized_geometry_count += 1
+                    optimized_bounds.extend(road_geometry)
+                    leg_distance = route_scenario.travel.distances_km[
+                        (start_id, end_id)
+                    ]
+                    leg_duration = route_scenario.travel.durations_min[
+                        (start_id, end_id)
+                    ]
+                    segment_color = OPTIMIZED_SEGMENT_COLORS[
+                        (leg_index - 1) % len(OPTIMIZED_SEGMENT_COLORS)
+                    ]
+                    start_name = escape(ordered_names[leg_index - 1])
+                    end_name = escape(ordered_names[leg_index])
+                    segment_description = (
+                        f"Segment {leg_index} | {start_name} → {end_name}"
+                    )
+                    folium.PolyLine(
+                        road_geometry,
+                        color=segment_color,
+                        weight=6,
+                        opacity=0.95 if not is_before else 0.55,
+                        dash_array="8, 7" if is_before else None,
+                        tooltip=(
+                            f"{label} | {route.plan.vehicle_id} | "
+                            f"{segment_description}"
+                        ),
+                        popup=(
+                            f"{escape(route.plan.vehicle_id)} | "
+                            f"{segment_description}<br>"
+                            f"{leg_distance:.1f} km | {leg_duration:.0f} min"
+                        ),
+                    ).add_to(feature_group)
+                    optimized_legend_items.append(
+                        '<span style="display:inline-block;width:16px;'
+                        f'border-top:4px solid {segment_color};margin-right:5px"></span>'
+                        f"{segment_description} — {leg_distance:.1f} km, "
+                        f"{leg_duration:.0f} min"
+                    )
+                continue
+
             if route_scenario.osrm_active:
                 road_geometry, geometry_error = get_osrm_route_geometry(requested_coordinates)
                 if road_geometry is not None:
@@ -218,7 +381,11 @@ def build_route_map(
             geometry_modes.append(used_osrm_geometry)
             route_cost = format_cost(route.total_cost)
             destination_names = [
-                escape(route_scenario.location_names[delivery_id])
+                escape(
+                    route_scenario.location_names[
+                        delivery_map[delivery_id].location
+                    ]
+                )
                 for delivery_id in route.plan.delivery_ids
             ]
             folium.PolyLine(
@@ -248,7 +415,26 @@ def build_route_map(
         )
 
     folium.LayerControl(collapsed=False).add_to(route_map)
-    if scenario.osrm_active and geometry_modes and all(geometry_modes):
+    if show_optimized_order and optimized_bounds:
+        route_map.fit_bounds(optimized_bounds, padding=(24, 24))
+    if show_optimized_order and not optimized_leg_count:
+        geometry_status = "No optimized route layer is currently selected."
+    elif show_optimized_order:
+        if optimized_geometry_count == optimized_leg_count:
+            geometry_status = (
+                f"OSRM road geometry shown for all {optimized_leg_count} optimized "
+                "route segments. Segment metrics use the optimizer travel matrix."
+            )
+        else:
+            geometry_status = (
+                f"OSRM road geometry unavailable for "
+                f"{optimized_leg_count - optimized_geometry_count} of "
+                f"{optimized_leg_count} optimized route segments; missing segments "
+                "are omitted. Route metrics remain from the optimizer travel matrix."
+            )
+            if geometry_errors:
+                geometry_status += f" First OSRM error: {geometry_errors[0]}"
+    elif scenario.osrm_active and geometry_modes and all(geometry_modes):
         geometry_status = "OSRM road geometry shown for all mapped routes."
     elif scenario.osrm_active and any(geometry_modes):
         geometry_status = "OSRM road geometry shown where available; straight-line polylines used otherwise."
@@ -264,6 +450,18 @@ def build_route_map(
         geometry_status += (
             " The separate selected-leg alternatives use returned OSRM road geometries."
         )
+    if show_optimized_order and optimized_legend_items:
+        legend = (
+            '<div style="position:fixed;bottom:24px;left:24px;z-index:9999;'
+            "max-width:340px;max-height:38vh;overflow:auto;"
+            "background:rgba(21,16,20,.96);color:#F3E9DA;padding:10px 12px;"
+            "border:1px solid #D8B866;border-radius:8px;font-size:12px\">"
+            "<strong>Optimized route legs</strong><ul style=\"padding-left:8px;"
+            f'margin:6px 0 0;list-style:none">{"".join(f"<li>{item}</li>" for item in optimized_legend_items)}</ul></div>'
+        )
+        from branca.element import Element
+
+        route_map.get_root().html.add_child(Element(legend))
     return RouteMapView(route_map, geometry_status)
 
 

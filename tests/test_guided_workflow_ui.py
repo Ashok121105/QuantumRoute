@@ -235,11 +235,33 @@ class GuidedWorkflowUITests(unittest.TestCase):
             )
         )
         scenario = SimpleNamespace(
+            vehicles=(
+                SimpleNamespace(
+                    vehicle_id="van-1",
+                    start_location="depot",
+                    end_location="depot",
+                ),
+            ),
             deliveries=deliveries,
             location_names={
-                delivery_id: name
-                for delivery_id, name, _, _ in delivery_values
+                "depot": "Guntur",
+                **{
+                    delivery_id: name
+                    for delivery_id, name, _, _ in delivery_values
+                },
             },
+            travel=SimpleNamespace(
+                distances_km={
+                    ("depot", "delivery-1"): 10.0,
+                    ("delivery-1", "delivery-2"): 20.0,
+                    ("delivery-2", "depot"): 30.0,
+                },
+                durations_min={
+                    ("depot", "delivery-1"): 12.0,
+                    ("delivery-1", "delivery-2"): 24.0,
+                    ("delivery-2", "depot"): 36.0,
+                },
+            ),
         )
         run = SimpleNamespace(
             classical=SimpleNamespace(routes=(route,)),
@@ -252,10 +274,11 @@ class GuidedWorkflowUITests(unittest.TestCase):
         with (
             patch("route_dashboard.ui._guided_optimization_signature", return_value="current"),
             patch("route_dashboard.ui._render_results"),
-            patch("route_dashboard.ui._render_route_map"),
+            patch("route_dashboard.ui._render_route_map") as render_route_map,
             patch("route_dashboard.ui._render_historical_ibm_evidence"),
         ):
             app.run()
+        self.assertTrue(render_route_map.call_args.kwargs["show_optimized_order"])
         self.assertFalse(app.exception, [str(item.value) for item in app.exception])
         self.assertTrue(
             any(
@@ -263,9 +286,27 @@ class GuidedWorkflowUITests(unittest.TestCase):
                 for item in app.markdown
             )
         )
+        self.assertTrue(
+            any("Optimized Delivery Order" in item.value for item in app.markdown)
+        )
+        self.assertTrue(
+            any("0. Guntur — Start" in item.value for item in app.markdown)
+        )
+        self.assertTrue(
+            any("1. First Stop" in item.value for item in app.markdown)
+        )
+        self.assertTrue(
+            any("2. Second Stop" in item.value for item in app.markdown)
+        )
+        self.assertTrue(
+            any("3. Guntur — Return" in item.value for item in app.markdown)
+        )
         assignments = app.dataframe[0].value
         self.assertEqual(assignments["Destination"].tolist(), ["First Stop", "Second Stop"])
         self.assertEqual(assignments["Vehicle"].tolist(), ["van-1", "van-1"])
+        legs = app.dataframe[1].value
+        self.assertEqual(legs["Distance (km)"].tolist(), [10.0, 20.0, 30.0])
+        self.assertEqual(legs["Travel time (min)"].tolist(), [12.0, 24.0, 36.0])
 
 
 if __name__ == "__main__":

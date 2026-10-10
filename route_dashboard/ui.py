@@ -813,6 +813,7 @@ def _render_route_map(
     run: OptimizationRun,
     comparison: TrafficReoptimization | None,
     key_prefix: str = "route_map",
+    show_optimized_order: bool = False,
 ) -> None:
     st.markdown("### Route map")
     map_col, map_info = st.columns([2.2, 1])
@@ -955,6 +956,7 @@ def _render_route_map(
             road_alternatives=scored_alternatives,
             selected_road_alternative_id=selected_alternative_id,
             show_road_alternatives=show_road_alternatives,
+            show_optimized_order=show_optimized_order,
         )
         st_folium(route_map.map, height=520, use_container_width=True, returned_objects=[])
         st.caption(route_map.geometry_status)
@@ -4100,7 +4102,8 @@ def _guided_map_preview() -> None:
         key="guided_location_preview_map",
     )
     st.caption(
-        f"The map shows the origin and all {len(destinations)} selected destination(s). "
+        f"Input/location preview — not an optimized route. The map shows the origin "
+        f"and all {len(destinations)} selected destination(s). "
         "The route optimization step builds the existing travel matrix and validates "
         "feasibility before solving."
     )
@@ -4256,12 +4259,14 @@ def _guided_final_results(
                 )
     st.markdown(f"### Assignments for all {len(scenario.deliveries)} destinations")
     st.dataframe(pd.DataFrame(assignments), hide_index=True, width="stretch")
+    _render_guided_optimized_delivery_order(scenario, run)
     _render_results(scenario, run)
     _render_route_map(
         scenario,
         run,
         None,
         key_prefix="guided_final_results",
+        show_optimized_order=True,
     )
 
     vehicle = st.session_state.get("guided_selected_vehicle")
@@ -4272,6 +4277,81 @@ def _guided_final_results(
         else:
             st.error("The optional cargo demand exceeds the selected vehicle's stated capacity.")
     _render_historical_ibm_evidence()
+
+
+def _render_guided_optimized_delivery_order(
+    scenario: ScenarioProblem,
+    run: OptimizationRun,
+) -> None:
+    st.markdown("### Optimized Delivery Order")
+    summaries = [("Classical exact", run.classical)]
+    if run.quantum is not None:
+        summaries.append(("QAOA / Aer", run.quantum))
+
+    vehicle_by_id = {vehicle.vehicle_id: vehicle for vehicle in scenario.vehicles}
+    delivery_by_id = {delivery.delivery_id: delivery for delivery in scenario.deliveries}
+    for solver, summary in summaries:
+        if len(summaries) > 1:
+            st.markdown(f"#### {solver}")
+        for route in summary.routes:
+            vehicle = vehicle_by_id[route.plan.vehicle_id]
+            start_name = scenario.location_names[vehicle.start_location]
+            end_name = scenario.location_names[vehicle.end_location]
+            ordered_ids = (
+                vehicle.start_location,
+                *(
+                    delivery_by_id[delivery_id].location
+                    for delivery_id in route.plan.delivery_ids
+                ),
+                vehicle.end_location,
+            )
+            ordered_names = tuple(
+                scenario.location_names[location_id]
+                for location_id in ordered_ids
+            )
+            stop_lines = [f"0. {start_name} — Start"]
+            stop_lines.extend(
+                f"{stop_number}. {scenario.location_names[delivery_by_id[delivery_id].location]}"
+                for stop_number, delivery_id in enumerate(
+                    route.plan.delivery_ids,
+                    start=1,
+                )
+            )
+            stop_lines.append(
+                f"{len(route.plan.delivery_ids) + 1}. {end_name} — Return"
+            )
+            st.markdown(f"**Vehicle: {route.plan.vehicle_id}**")
+            st.markdown("\n".join(f"{line}  " for line in stop_lines))
+
+            leg_rows = []
+            for leg_index, (start_id, end_id) in enumerate(
+                zip(ordered_ids, ordered_ids[1:]),
+                start=1,
+            ):
+                start_label = (
+                    f"Stop {leg_index - 1} — {ordered_names[leg_index - 1]}"
+                    if leg_index > 1
+                    else f"{ordered_names[0]} — Origin"
+                )
+                end_label = (
+                    f"Stop {leg_index} — {ordered_names[leg_index]}"
+                    if leg_index <= len(route.plan.delivery_ids)
+                    else f"{ordered_names[-1]} — Return"
+                )
+                leg_rows.append(
+                    {
+                        "Leg": leg_index,
+                        "Start": start_label,
+                        "End": end_label,
+                        "Distance (km)": scenario.travel.distances_km[
+                            (start_id, end_id)
+                        ],
+                        "Travel time (min)": scenario.travel.durations_min[
+                            (start_id, end_id)
+                        ],
+                    }
+                )
+            st.dataframe(pd.DataFrame(leg_rows), hide_index=True, width="stretch")
 
 
 def _reset_guided_route() -> None:
