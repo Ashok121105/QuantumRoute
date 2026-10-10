@@ -1,9 +1,13 @@
 """Streamlit dashboard for scenario setup, optimization, and route inspection."""
 
+from __future__ import annotations
+
 from datetime import time
 from hashlib import sha256
-from math import isclose, isfinite
+import json
+from math import isfinite
 from pathlib import Path
+from typing import TypeGuard
 
 import altair as alt
 import pandas as pd
@@ -12,6 +16,14 @@ import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 
 from quantum_route_optimisation import QAOAConfig
+from ibm_execution import HardwareDryRunResult, HardwareJobState
+from ibm_quantum import (
+    IBMBackendDiscovery,
+    IBMBackendMetadata,
+    IBMQuantumStatus,
+    discover_ibm_backends,
+    ibm_quantum_status_report,
+)
 
 from .dynamic import TrafficReoptimization, calculate_route_impact, reoptimize_for_traffic
 from .custom_routes import (
@@ -42,6 +54,7 @@ from .demo_mode import (
 from .map_view import (
     ScoredRoadAlternative,
     build_route_map,
+    build_location_preview_map,
     rank_road_alternatives,
 )
 from .benchmark_suite import BenchmarkResult, generate_benchmark_scenarios, run_benchmark
@@ -66,27 +79,9 @@ from .history import (
     new_run_id,
 )
 from .history_ui import render_history_page
-from ibm_quantum import (
-    IBMBackendDiscovery,
-    IBMBackendMetadata,
-    connect_ibm_quantum,
-    discover_ibm_backends,
-    ibm_quantum_status_report,
-)
-from ibm_execution import (
-    DEFAULT_SHOTS,
-    MAX_SHOTS,
-    HardwareDryRunResult,
-    HardwareJobState,
-    dry_run_optimized_qaoa_execution,
-    refresh_hardware_job_status,
-    submit_confirmed_hardware_job,
-)
-from ibm_hardware_evidence import HardwareEvidenceError, write_hardware_evidence
-from ibm_qaoa_adapter import build_demo_route_qubo, route_qubo_fingerprint
-from ibm_qaoa_parameters import (
-    DEFAULT_DEMO_QAOA_CONFIG,
-    optimize_demo_qaoa_parameters,
+from ibm_hardware_evidence import (
+    HardwareEvidenceError,
+    validate_hardware_evidence_record,
 )
 from .objectives import (
     OBJECTIVE_DESCRIPTIONS,
@@ -97,6 +92,7 @@ from .objectives import (
 from .optimization import OptimizationRun, RouteSummary, optimize_scenario
 from .scenario import (
     FUEL_OPTIONS,
+    MAX_DASHBOARD_DELIVERIES,
     DeliveryStop,
     ScenarioProblem,
     build_scenario,
@@ -129,6 +125,21 @@ _browser_location_component = components.declare_component(
     path=str(Path(__file__).parent / "components" / "geolocation"),
 )
 
+_HISTORICAL_IBM_JOB_ID = "db4pdpsvf2bc73cuu22g"
+_HISTORICAL_IBM_EVIDENCE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "artifacts"
+    / "ibm_hardware"
+    / f"ibm_hardware_{_HISTORICAL_IBM_JOB_ID}.json"
+)
+_HISTORICAL_IBM_MANIFEST_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "artifacts"
+    / "ibm_hardware"
+    / "manifests"
+    / "quantumroute_run_aa673f1a-d9f1-4900-98d5-5d15c7688d5f.json"
+)
+
 
 def main() -> None:
     st.set_page_config(
@@ -138,6 +149,7 @@ def main() -> None:
     )
     if st.session_state.pop("history_navigation_requested", False):
         st.session_state["active_page"] = "Route Optimization"
+        st.session_state["advanced_page"] = "Route Optimization"
     _apply_history_plan_draft()
     apply_theme()
     qaoa_config, use_osrm, page = _render_sidebar()
@@ -149,7 +161,9 @@ def main() -> None:
     if current is None and disruption is not None and disruption.after_run is not None:
         current = {"scenario": disruption.optimization_scenario, "run": disruption.after_run}
     _render_page_header(page, current)
-    if page == "Dashboard":
+    if page == "Guided Workflow":
+        _render_guided_workflow(qaoa_config, use_osrm)
+    elif page == "Dashboard":
         _render_dashboard(current)
     elif page == "Route Optimization":
         plan_notice = st.session_state.pop("history_plan_notice", None)
@@ -201,7 +215,20 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
             '<div class="qr-subtitle">Smarter Routes. Greener Tomorrow.</div>',
             unsafe_allow_html=True,
         )
-        st.markdown("#### Workspace")
+        st.markdown("#### Main workflow")
+        st.button(
+            "A–F Guided Workflow",
+            type=(
+                "primary"
+                if st.session_state.get("active_page", "Guided Workflow")
+                == "Guided Workflow"
+                else "secondary"
+            ),
+            use_container_width=True,
+            on_click=_set_active_page,
+            args=("Guided Workflow",),
+            key="guided_workflow_navigation",
+        )
         nav_icons = {
             "Dashboard": "dashboard",
             "Route Optimization": "route",
@@ -213,9 +240,7 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
             "IBM Quantum Hardware": "memory",
             "History": "history",
         }
-        page = st.radio(
-            "Workspace navigation",
-            (
+        advanced_pages = (
                 "Dashboard",
                 "Route Optimization",
                 "Dynamic Traffic",
@@ -225,12 +250,18 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
                 "Custom Route Planner",
                 "Benchmark Mode",
                 "History",
-            ),
-            format_func=lambda value: f":material/{nav_icons[value]}: {value}",
-            key="active_page",
-            label_visibility="collapsed",
         )
-        st.divider()
+        if "active_page" not in st.session_state:
+            st.session_state["active_page"] = "Guided Workflow"
+        with st.expander("Advanced Tools", expanded=False):
+            st.radio(
+                "Advanced workspace",
+                advanced_pages,
+                format_func=lambda value: f":material/{nav_icons[value]}: {value}",
+                key="advanced_page",
+                on_change=_activate_advanced_page,
+            )
+        page = st.session_state.get("active_page", "Guided Workflow")
         st.divider()
         with st.expander("Solver & routing settings", expanded=False):
             st.caption("QAOA executes locally on Qiskit Aer.")
@@ -252,6 +283,14 @@ def _render_sidebar() -> tuple[QAOAConfig, bool, str]:
     return QAOAConfig(reps=int(reps), maxiter=int(maxiter), shots=int(shots), seed=int(seed)), use_osrm, page
 
 
+def _set_active_page(page: str) -> None:
+    st.session_state["active_page"] = page
+
+
+def _activate_advanced_page() -> None:
+    st.session_state["active_page"] = st.session_state["advanced_page"]
+
+
 def _format_money(amount_in_cost_units: float) -> str:
     return format_cost(amount_in_cost_units)
 
@@ -263,6 +302,7 @@ def _format_money_delta(amount_in_cost_units: float) -> str:
 
 def _render_page_header(page: str, current: dict[str, object] | None) -> None:
     titles = {
+        "Guided Workflow": "Logistics workflow",
         "Dashboard": "Operations overview",
         "Route Optimization": "Route optimization",
         "Dynamic Traffic": "Dynamic traffic",
@@ -1642,6 +1682,9 @@ def _render_demo_mode() -> None:
         "A fixed local scenario runs through classical/QAOA planning, objective trade-offs, "
         "simulated traffic, and fleet disruption. No live traffic or routing APIs are used."
     )
+    st.info(
+        "Demo Mode does not connect to IBM Quantum, poll jobs, or submit hardware work."
+    )
     run_col, reset_col = st.columns([3, 1])
     run_demo = run_col.button(
         "▶ Run Full Demo",
@@ -1793,157 +1836,17 @@ def _render_quantum_execution_comparison(
     demo: HackathonDemoResult | None,
 ) -> None:
     st.markdown("## 06 / Quantum Execution Comparison · DEMO")
-    job_state: HardwareJobState | None = st.session_state.get("ibm_hardware_job_state")
-    dry_run: HardwareDryRunResult | None = st.session_state.get("ibm_hardware_dry_run")
-    if (
-        job_state is None
-        or not job_state.job_id
-        or job_state.status.upper() != "DONE"
-        or not job_state.measurement_result_received
-        or dry_run is None
-        or dry_run.execution_package is None
-    ):
-        st.info("No completed IBM Quantum hardware result available for this session.")
-        return
-
-    if demo is None:
-        st.info("Run Full Demo to compare the completed hardware result with local and classical results.")
-        return
-
-    if not _completed_hardware_result_compatible(job_state, dry_run, demo):
-        st.warning(
-            "The completed IBM hardware result belongs to a different scenario; "
-            "its metrics are not combined with the current Demo Mode results."
-        )
-        st.caption("The captured hardware measurement distribution remains available in the IBM Quantum Hardware workspace.")
-        return
-
     st.caption(
-        "Classical Optimization → Local Aer QAOA → Real IBM Quantum Hardware. "
-        "This is an actual Qiskit workflow executed on IBM Quantum hardware. "
-        "This small demo is stochastic; matching results do not demonstrate quantum advantage."
+        "This section describes the local Demo Mode execution only. The completed "
+        "IBM hardware result is a separate historical demonstration and is not "
+        "combined with the current Demo Mode run."
     )
-    st.markdown("#### REAL IBM QUANTUM HARDWARE")
-    st.write(
-        f"Backend: {job_state.backend_name} | Shots: {job_state.shots} | "
-        f"Status: {job_state.status} | Job ID: {job_state.job_id}"
-    )
-    counts = pd.DataFrame(
-        [
-            {"Measured bitstring": bitstring, "Count": count}
-            for bitstring, count in job_state.raw_counts
-        ]
-    )
-    if not counts.empty:
-        with st.expander("Hardware measurement distribution", expanded=False):
-            st.dataframe(counts, hide_index=True, width="stretch")
-            st.caption(
-                f"Most frequent bitstring: {job_state.most_frequent_bitstring}; "
-                f"selected feasible candidate: {job_state.selected_solution_bitstring or 'none'}"
-            )
-
-    if job_state.route_valid is not True:
-        st.error("Hardware result did not produce a valid route.")
-        st.caption(job_state.route_message or "No hardware route metrics are mixed into this comparison.")
-        return
-
-    st.success("Real IBM hardware result passed feasibility validation.")
-    scenario = demo.scenario
-    classical = demo.baseline_run.classical
-    local_qaoa = demo.baseline_run.quantum
-    hardware = _route_summary_from_routes(job_state.decoded_routes)
-    columns = st.columns(3)
-    _render_execution_comparison_column(columns[0], "CLASSICAL OPTIMIZATION", scenario, classical)
-    if local_qaoa is not None:
-        _render_execution_comparison_column(columns[1], "LOCAL AER QAOA", scenario, local_qaoa)
+    if demo is None:
+        st.info("Run Full Demo to display the current local classical and Aer results.")
     else:
-        columns[1].markdown("#### LOCAL AER QAOA")
-        columns[1].info("No valid local Aer QAOA result is available for comparison.")
-    _render_execution_comparison_column(
-        columns[2],
-        "REAL IBM QUANTUM HARDWARE",
-        scenario,
-        hardware,
-        backend=job_state.backend_name,
-        shots=job_state.shots,
-        status=job_state.status,
-        job_id=job_state.job_id,
-    )
-
-    if local_qaoa is not None and _execution_metrics_match(
-        scenario,
-        (classical, local_qaoa, hardware),
-    ):
-        st.info("The three sets of route metrics matched for this demo case.")
-    st.caption("Hardware measurements are stochastic; no approach is ranked.")
-
-
-def _render_execution_comparison_column(
-    column,
-    heading: str,
-    scenario: ScenarioProblem,
-    summary: RouteSummary,
-    *,
-    backend: str | None = None,
-    shots: int | None = None,
-    status: str | None = None,
-    job_id: str | None = None,
-) -> None:
-    column.markdown(f"#### {heading}")
-    impact = calculate_route_impact(scenario, summary)
-    column.caption(impact.route_description or "No route")
-    column.metric("Distance", f"{impact.distance_km:.2f} km")
-    column.metric("Travel time", _format_duration(impact.travel_time_min))
-    column.metric("Cost", _format_money(impact.cost))
-    column.metric("Fuel", f"{impact.fuel_used:.3f} {impact.fuel_unit}")
-    column.metric("CO2", f"{impact.tailpipe_co2_kg:.3f} kg")
-    if backend is not None:
-        column.caption(f"Backend: {backend} | Shots: {shots} | Status: {status} | Job ID: {job_id}")
-
-
-def _execution_metrics_match(
-    scenario: ScenarioProblem,
-    summaries: tuple[RouteSummary, ...],
-) -> bool:
-    impacts = tuple(calculate_route_impact(scenario, summary) for summary in summaries)
-    reference = impacts[0]
-    for impact in impacts[1:]:
-        if (
-            not isclose(reference.distance_km, impact.distance_km, abs_tol=0.01)
-            or not isclose(reference.travel_time_min, impact.travel_time_min, abs_tol=0.5)
-            or not isclose(reference.cost, impact.cost, abs_tol=0.01)
-            or not isclose(reference.fuel_used, impact.fuel_used, abs_tol=0.001)
-            or not isclose(reference.tailpipe_co2_kg, impact.tailpipe_co2_kg, abs_tol=0.001)
-        ):
-            return False
-    return True
-
-
-def _completed_hardware_result_compatible(
-    job_state: HardwareJobState,
-    dry_run: HardwareDryRunResult | None,
-    demo: HackathonDemoResult | None,
-) -> bool:
-    if (
-        demo is None
-        or job_state.status.upper() != "DONE"
-        or not job_state.job_id
-        or not job_state.measurement_result_received
-        or dry_run is None
-        or dry_run.execution_package is None
-    ):
-        return False
-    package = dry_run.execution_package
-    return (
-        dry_run.ready
-        and dry_run.backend is not None
-        and dry_run.backend.name == job_state.backend_name
-        and dry_run.shots == job_state.shots
-        and package.parameter_source == "local_aer_optimized"
-        and demo.scenario == build_hackathon_demo_scenario()
-        and package.problem_signature == route_qubo_fingerprint(build_demo_route_qubo())
-        and package.problem.route_variable_count == 4
-    )
+        st.caption(
+            "Open the IBM Quantum Hardware workspace for the validated read-only historical record."
+        )
 
 
 def _render_demo_baseline(demo: HackathonDemoResult) -> None:
@@ -2348,14 +2251,10 @@ def _render_demo_summary(demo: HackathonDemoResult) -> None:
             unsafe_allow_html=True,
         )
 
-        job_state: HardwareJobState | None = st.session_state.get("ibm_hardware_job_state")
-        if job_state is not None and job_state.job_id and job_state.status.upper() == "DONE":
-            st.caption(
-                f"Hardware evidence: {job_state.backend_name} · {job_state.shots} shots · "
-                f"{job_state.status}. Measurements are stochastic; this is not a claim of quantum advantage."
-            )
-        else:
-            st.caption("Hardware evidence: no completed IBM Quantum result is available for this session.")
+        st.caption(
+            "Any IBM hardware result is a separate, historical demonstration; "
+            "this Demo Mode run uses local computation only."
+        )
 
         summary = demo.sustainability.metrics
         metric_columns = st.columns(5)
@@ -2371,8 +2270,242 @@ def _render_demo_summary(demo: HackathonDemoResult) -> None:
     st.success("QuantumRoute Demonstration Complete")
 
 
+def _render_execution_comparison_column(
+    column,
+    heading: str,
+    scenario: ScenarioProblem,
+    summary: RouteSummary,
+) -> None:
+    column.markdown(f"#### {heading}")
+    impact = calculate_route_impact(scenario, summary)
+    column.caption(impact.route_description or "No route")
+    column.metric("Distance", f"{impact.distance_km:.2f} km")
+    column.metric("Travel time", _format_duration(impact.travel_time_min))
+    column.metric("Cost", _format_money(impact.cost))
+    column.metric("Fuel", f"{impact.fuel_used:.3f} {impact.fuel_unit}")
+    column.metric("CO2", f"{impact.tailpipe_co2_kg:.3f} kg")
+
+
+def _load_historical_ibm_evidence() -> dict[str, object]:
+    try:
+        record = json.loads(_HISTORICAL_IBM_EVIDENCE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            raise HardwareEvidenceError("Saved evidence is not a JSON object.")
+        validate_hardware_evidence_record(record)
+        manifest_bytes = _HISTORICAL_IBM_MANIFEST_PATH.read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        HardwareEvidenceError,
+        KeyError,
+        TypeError,
+    ) as error:
+        raise HardwareEvidenceError(
+            "The saved historical IBM evidence or provenance manifest could not be validated."
+        ) from error
+
+    if not isinstance(manifest, dict):
+        raise HardwareEvidenceError("The saved pre-submission manifest is invalid.")
+    expected_hash = record.get("pre_submission_manifest_sha256")
+    if (
+        record.get("job_id") != _HISTORICAL_IBM_JOB_ID
+        or record.get("backend") != "ibm_marrakesh"
+        or record.get("status") != "DONE"
+        or record.get("shots") != 256
+        or record.get("shots_returned") != 256
+        or manifest != record.get("pre_submission_manifest")
+        or manifest.get("run_id") != record.get("run_id")
+        or not isinstance(expected_hash, str)
+        or sha256(manifest_bytes).hexdigest() != expected_hash
+    ):
+        raise HardwareEvidenceError(
+            "The saved hardware evidence does not match the expected job and provenance."
+        )
+    solution = record.get("decoded_solution")
+    validation = record.get("route_validation")
+    if (
+        not isinstance(solution, dict)
+        or solution.get("selected_bitstring") != "1010"
+        or not isinstance(validation, dict)
+        or validation.get("passed") is not True
+    ):
+        raise HardwareEvidenceError(
+            "The saved hardware evidence does not contain the verified candidate and validation."
+        )
+    return record
+
+
+def _render_historical_ibm_evidence() -> None:
+    try:
+        record = _load_historical_ibm_evidence()
+    except HardwareEvidenceError:
+        st.info(
+            "The previous hardware demonstration is not shown because its saved evidence "
+            "and provenance could not be validated."
+        )
+        return
+
+    st.markdown("### Previous hardware run · not this route scenario")
+    st.caption(
+        f"Previous hardware run · Backend: {record['backend']} · "
+        f"Status: {record['status']} · "
+        f"Shots: {record['shots']} requested / {record['shots_returned']} returned · "
+        f"Job ID: {record['job_id']}"
+    )
+    counts = record["measurement_counts"]
+    solution = record["decoded_solution"]
+    validation = record["route_validation"]
+    if not isinstance(counts, dict) or not isinstance(solution, dict) or not isinstance(validation, dict):
+        st.info("Saved evidence details are malformed and cannot be displayed.")
+        return
+    most_frequent = record["most_frequent_bitstring"]
+    most_frequent_count = counts.get(most_frequent)
+    if (
+        not isinstance(most_frequent, str)
+        or not isinstance(most_frequent_count, int)
+        or isinstance(most_frequent_count, bool)
+    ):
+        st.info("Saved measurement frequency details are malformed and cannot be displayed.")
+        return
+    st.markdown("#### Measurement summary")
+    measurement_columns = st.columns(4)
+    measurement_columns[0].metric("Most frequent bitstring", most_frequent)
+    measurement_columns[1].metric("Count", most_frequent_count)
+    measurement_columns[2].metric(
+        "Frequency",
+        f"{most_frequent_count / int(record['shots_returned']) * 100:.2f}%",
+    )
+    measurement_columns[3].metric("Feasibility", "PASS" if validation["passed"] else "FAIL")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {"Measured bitstring": bitstring, "Count": count}
+                for bitstring, count in counts.items()
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    st.markdown("#### Decoded assignments")
+    decoded_routes = solution.get("routes")
+    if not isinstance(decoded_routes, list):
+        st.info("Saved decoded routes are malformed and cannot be displayed.")
+        return
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Vehicle": route["vehicle_id"],
+                    "Destination": ", ".join(route["delivery_names"]),
+                }
+                for route in decoded_routes
+                if isinstance(route, dict)
+                and isinstance(route.get("vehicle_id"), str)
+                and isinstance(route.get("delivery_names"), list)
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    st.success(
+        f"Historical decoded candidate {solution['selected_bitstring']} passed "
+        f"feasibility validation: {validation['message']}"
+    )
+    route_impact = record.get("route_impact")
+    if isinstance(route_impact, dict):
+        st.markdown("#### Route metrics · QuantumRoute classical calculations")
+        st.caption(
+            "Distance, travel time, operating cost, fuel, and CO2 are calculated by "
+            "QuantumRoute classical software from the decoded route; they are not "
+            "measurements produced by IBM hardware."
+        )
+        metric_columns = st.columns(5)
+        metric_columns[0].metric(
+            "Distance",
+            f"{float(route_impact['distance_km']):.3f} km",
+        )
+        metric_columns[1].metric(
+            "Travel time",
+            f"{float(route_impact['travel_time_min']):.3f} min",
+        )
+        metric_columns[2].metric(
+            "Operating cost",
+            f"₹{float(record['operating_cost_inr']):.2f}",
+        )
+        metric_columns[3].metric(
+            "Fuel",
+            f"{float(route_impact['fuel_used']):.3f} {route_impact['fuel_unit']}",
+        )
+        metric_columns[4].metric(
+            "CO2",
+            f"{float(route_impact['tailpipe_co2_kg']):.3f} kg",
+        )
+
+
 def _render_ibm_quantum_hardware() -> None:
-    st.markdown("## IBM Quantum Hardware")
+    st.markdown("## Previous IBM Quantum Hardware Run")
+    st.caption(
+        "This workspace is read-only. It displays only the locally saved, validated "
+        "historical hardware evidence. Backend discovery is separately available on "
+        "explicit request; this workspace cannot submit, poll, or create jobs."
+    )
+    _render_read_only_ibm_backend_discovery()
+    _render_historical_ibm_evidence()
+    return
+
+
+def _render_read_only_ibm_backend_discovery() -> None:
+    st.markdown("### Optional backend metadata")
+    st.caption(
+        "Discovery runs only after you click the button. It reads backend metadata "
+        "and does not submit quantum circuits or jobs."
+    )
+    if st.button(
+        "Discover IBM Backends",
+        type="secondary",
+        key="discover_ibm_backends",
+    ):
+        st.session_state["ibm_backend_discovery"] = discover_ibm_backends()
+
+    discovery: IBMBackendDiscovery | None = st.session_state.get(
+        "ibm_backend_discovery"
+    )
+    if discovery is None:
+        st.info("Select Discover IBM Backends to request read-only backend metadata.")
+        return
+
+    status_report = ibm_quantum_status_report(discovery)
+    if discovery.status is IBMQuantumStatus.BACKEND_DISCOVERY_SUCCESSFUL:
+        st.success(status_report)
+    elif discovery.status is IBMQuantumStatus.NO_ACCESSIBLE_BACKENDS:
+        st.warning(status_report)
+    else:
+        st.error(status_report)
+
+    if not discovery.backends:
+        return
+    st.dataframe(
+        pd.DataFrame(
+            [_ibm_backend_display_row(backend) for backend in discovery.backends]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption("No quantum circuits or jobs are submitted from this workspace.")
+    backend_names = tuple(backend.name for backend in discovery.backends)
+    selected_name = st.selectbox(
+        "Select discovered backend",
+        backend_names,
+        key="selected_ibm_backend",
+    )
+    selected_backend = _find_ibm_backend(selected_name, discovery.backends)
+    if selected_backend is not None:
+        _render_selected_ibm_backend(selected_backend)
+
+
+def _render_disabled_hardware_controls() -> None:
     st.caption(
         "Discovery remains read-only. No quantum circuits or jobs are submitted from this workspace until you explicitly confirm a REAL IBM hardware job."
     )
@@ -3417,6 +3550,770 @@ def _format_duration(minutes: float) -> str:
     return f"{hours} h {remainder:02d} min" if hours else f"{remainder} min"
 
 
+_GUIDED_STEPS = (
+    "A — Company Details",
+    "B — Fleet Details",
+    "C — Delivery Details",
+    "D — Map Preview",
+    "E — Optimize Routes",
+    "F — Final Results",
+)
+
+
+def _render_guided_workflow(qaoa_config: QAOAConfig, use_osrm: bool) -> None:
+    step = int(st.session_state.get("guided_step", 0))
+    step = min(max(step, 0), len(_GUIDED_STEPS) - 1)
+    st.session_state["guided_step"] = step
+    st.markdown("## Guided logistics workflow")
+    st.caption(
+        "Company and fleet inputs remain in this Streamlit session. No profile is "
+        "written to a new backend or database."
+    )
+    st.progress((step + 1) / len(_GUIDED_STEPS), text=" → ".join(_GUIDED_STEPS))
+    st.markdown(f"### {_GUIDED_STEPS[step]}")
+    validation_error = st.session_state.pop("guided_validation_error", None)
+    if validation_error:
+        st.error(validation_error)
+    if step == 0:
+        _guided_company_details()
+    elif step == 1:
+        selected_vehicle = _render_custom_fleet_profile(key_prefix="guided")
+        st.session_state["guided_selected_vehicle"] = selected_vehicle
+        _guided_optimizer_fleet_inputs(selected_vehicle)
+    elif step == 2:
+        _guided_delivery_details()
+    elif step == 3:
+        _guided_map_preview()
+    elif step == 4:
+        _guided_route_optimization(qaoa_config, use_osrm)
+    else:
+        _guided_final_results(qaoa_config, use_osrm)
+
+    back, _, next_col = st.columns((1, 3, 1))
+    with back:
+        st.button(
+            "Back",
+            disabled=step == 0,
+            use_container_width=True,
+            on_click=_set_guided_step,
+            args=(max(0, step - 1),),
+            key=f"guided_back_{step}",
+        )
+    with next_col:
+        if step < len(_GUIDED_STEPS) - 1:
+            st.button(
+                "Next",
+                type="primary",
+                use_container_width=True,
+                on_click=_advance_guided_step,
+                args=(step,),
+                key=f"guided_next_{step}",
+            )
+        else:
+            st.button(
+                "Start a new route",
+                use_container_width=True,
+                on_click=_reset_guided_route,
+                key="guided_reset_route",
+            )
+
+
+def _set_guided_step(step: int) -> None:
+    st.session_state["guided_step"] = step
+
+
+def _guided_destination_ids() -> list[int]:
+    destination_ids = st.session_state.get("guided_destination_ids")
+    if not isinstance(destination_ids, list):
+        destination_ids = [0]
+    destination_ids = [
+        destination_id
+        for destination_id in destination_ids
+        if isinstance(destination_id, int) and not isinstance(destination_id, bool)
+    ]
+    destination_ids = list(dict.fromkeys(destination_ids))
+    if not destination_ids:
+        destination_ids = [0]
+    st.session_state["guided_destination_ids"] = destination_ids
+    next_id = st.session_state.get("guided_destination_next_id", 1)
+    if not isinstance(next_id, int) or isinstance(next_id, bool):
+        next_id = max(destination_ids, default=-1) + 1
+    st.session_state["guided_destination_next_id"] = max(
+        next_id,
+        max(destination_ids, default=-1) + 1,
+    )
+    return destination_ids
+
+
+def _add_guided_destination() -> None:
+    destination_ids = _guided_destination_ids()
+    if len(destination_ids) >= MAX_DASHBOARD_DELIVERIES:
+        return
+    next_id = int(st.session_state["guided_destination_next_id"])
+    st.session_state["guided_destination_ids"] = [*destination_ids, next_id]
+    st.session_state["guided_destination_next_id"] = next_id + 1
+
+
+def _remove_guided_destination(destination_id: int) -> None:
+    destination_ids = _guided_destination_ids()
+    if destination_id not in destination_ids or destination_id == destination_ids[0]:
+        return
+    st.session_state["guided_destination_ids"] = [
+        item for item in destination_ids if item != destination_id
+    ]
+    for key in (
+        f"guided_destination_location_{destination_id}",
+        f"guided_destination_search_results_{destination_id}",
+        f"guided_destination_search_error_{destination_id}",
+        f"guided_destination_query_{destination_id}",
+        f"guided_destination_selection_{destination_id}",
+        f"guided_destination_name_{destination_id}",
+        f"guided_destination_demand_{destination_id}",
+        f"guided_destination_window_start_{destination_id}",
+        f"guided_destination_window_end_{destination_id}",
+        f"guided_destination_service_{destination_id}",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state.pop("guided_optimization_signature", None)
+
+
+def _guided_optimizer_fleet_inputs(
+    selected_vehicle: dict[str, object] | None,
+) -> None:
+    capacity_default = 2.0
+    if isinstance(selected_vehicle, dict) and _custom_number(
+        selected_vehicle.get("capacity"),
+        positive=True,
+    ):
+        capacity_default = float(selected_vehicle["capacity"])
+
+    defaults = {
+        "guided_vehicle_count": 2,
+        "guided_vehicle_capacity": capacity_default,
+        "guided_shift_start": time(8, 0),
+        "guided_shift_end": time(17, 0),
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    st.markdown("### Optimizer fleet constraints")
+    vehicle_col, capacity_col = st.columns(2)
+    vehicle_col.number_input(
+        "Vehicles available to optimizer",
+        min_value=1,
+        max_value=8,
+        step=1,
+        key="guided_vehicle_count",
+    )
+    capacity_col.number_input(
+        "Capacity per vehicle",
+        min_value=0.1,
+        max_value=1000.0,
+        step=0.5,
+        key="guided_vehicle_capacity",
+        help="The selected uploaded vehicle seeds this value when available.",
+    )
+    shift_col, end_col = st.columns(2)
+    shift_col.time_input("Shift starts", key="guided_shift_start")
+    end_col.time_input("Shift ends", key="guided_shift_end")
+    st.caption(
+        "These constraints feed the existing feasibility and route-optimization pipeline. "
+        "All optimizer vehicles use the same capacity and shift in this workflow."
+    )
+
+
+def _advance_guided_step(step: int) -> None:
+    error = _guided_step_error(step)
+    if error:
+        st.session_state["guided_validation_error"] = error
+        return
+    st.session_state.pop("guided_validation_error", None)
+    st.session_state["guided_step"] = min(step + 1, len(_GUIDED_STEPS) - 1)
+
+
+def _guided_step_error(step: int) -> str | None:
+    if step == 0:
+        required = {
+            "Company name": st.session_state.get("company_name", "").strip(),
+            "Company ID": st.session_state.get("company_id", "").strip(),
+            "Branch / dispatch location": st.session_state.get("company_dispatch_location", "").strip(),
+        }
+        missing = [label for label, value in required.items() if not value]
+        return "Complete the required company fields: " + ", ".join(missing) + "." if missing else None
+    if step == 1:
+        fingerprint = st.session_state.get("custom_fleet_upload_fingerprint")
+        validation = st.session_state.get("custom_fleet_validation")
+        if validation is not None and not validation.valid:
+            return "Correct the fleet upload validation errors or clear the invalid upload before continuing."
+        if fingerprint and st.session_state.get("custom_fleet_accepted_fingerprint") != fingerprint:
+            return "Review the fleet preview and explicitly accept it, or clear the upload to continue without fleet data."
+    if step == 2:
+        origin = st.session_state.get("custom_origin")
+        if not _is_guided_location(origin):
+            return "Select a valid origin using place search or current location."
+        destination_ids = _guided_destination_ids()
+        if not 1 <= len(destination_ids) <= MAX_DASHBOARD_DELIVERIES:
+            return f"Select between 1 and {MAX_DASHBOARD_DELIVERIES} destinations."
+        try:
+            stops = _guided_delivery_stops()
+            selected_coordinates = [
+                (float(origin["latitude"]), float(origin["longitude"])),
+                *((stop.latitude, stop.longitude) for stop in stops),
+            ]
+            if len(set(selected_coordinates)) != len(selected_coordinates):
+                return "Origin and destination locations must all be different."
+            vehicle_count = int(st.session_state.get("guided_vehicle_count", 2))
+            vehicle_capacity = float(
+                st.session_state.get("guided_vehicle_capacity", 2.0)
+            )
+            shift_start = st.session_state.get("guided_shift_start", time(8, 0))
+            shift_end = st.session_state.get("guided_shift_end", time(17, 0))
+            build_scenario(
+                stops,
+                vehicle_count=vehicle_count,
+                vehicle_capacity=vehicle_capacity,
+                depot_name=str(origin["label"]),
+                depot_latitude=float(origin["latitude"]),
+                depot_longitude=float(origin["longitude"]),
+                shift_start_min=_time_to_minutes(shift_start),
+                shift_end_min=_time_to_minutes(shift_end),
+                traffic_condition="Moderate",
+                fuel_type="Diesel",
+                fuel_price_per_unit=FUEL_OPTIONS["Diesel"]["default_price"],
+            )
+        except (ValueError, TypeError, KeyError) as error:
+            return f"Delivery details are invalid: {error}"
+    if step == 4 and not isinstance(st.session_state.get("guided_run"), dict):
+        return "Run the optimizer for all selected destinations before continuing."
+    return None
+
+
+def _is_guided_location(location: object) -> TypeGuard[dict[str, object]]:
+    if not isinstance(location, dict):
+        return False
+    label = location.get("label")
+    latitude = location.get("latitude")
+    longitude = location.get("longitude")
+    return (
+        isinstance(label, str)
+        and bool(label.strip())
+        and isinstance(latitude, (int, float))
+        and not isinstance(latitude, bool)
+        and isfinite(float(latitude))
+        and -90 <= latitude <= 90
+        and isinstance(longitude, (int, float))
+        and not isinstance(longitude, bool)
+        and isfinite(float(longitude))
+        and -180 <= longitude <= 180
+    )
+
+
+def _guided_company_details() -> None:
+    fields = (
+        ("Company name *", "company_name"),
+        ("Company ID *", "company_id"),
+        ("Branch / dispatch location *", "company_dispatch_location"),
+        ("Contact name (optional)", "company_contact_name"),
+        ("Contact details (optional)", "company_contact_details"),
+    )
+    for label, state_key in fields:
+        widget_key = f"guided_{state_key}_input"
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = st.session_state.get(state_key, "")
+        st.text_input(
+            label,
+            key=widget_key,
+            on_change=_sync_guided_value,
+            args=(widget_key, state_key),
+        )
+    st.info("Company details are session-only and are not persisted.")
+
+
+def _sync_guided_value(widget_key: str, state_key: str) -> None:
+    st.session_state[state_key] = st.session_state[widget_key]
+
+
+def _guided_delivery_details() -> None:
+    st.caption(
+        "Search uses the existing Nominatim integration. Browser location permission "
+        "is requested only after clicking the explicit current-location button."
+    )
+    _render_custom_place_search("origin")
+    if st.button(
+        "Use My Current Location",
+        key="guided_use_current_location",
+        type="secondary",
+    ):
+        st.session_state["guided_request_browser_location"] = True
+        st.session_state["custom_geolocation_generation"] = (
+            int(st.session_state.get("custom_geolocation_generation", 0)) + 1
+        )
+    if st.session_state.get("guided_request_browser_location"):
+        generation = int(st.session_state.get("custom_geolocation_generation", 0))
+        location = _browser_location_component(
+            key=f"guided_browser_location_{generation}",
+            default=None,
+        )
+        if isinstance(location, dict):
+            error = location.get("error")
+            if error:
+                st.warning(str(error))
+                st.session_state["guided_request_browser_location"] = False
+            else:
+                latitude, longitude = location.get("latitude"), location.get("longitude")
+                if (
+                    isinstance(latitude, (int, float))
+                    and isinstance(longitude, (int, float))
+                    and -90 <= latitude <= 90
+                    and -180 <= longitude <= 180
+                ):
+                    st.session_state["custom_origin"] = {
+                        "label": "Current location (browser permission)",
+                        "latitude": float(latitude),
+                        "longitude": float(longitude),
+                        "source": "Browser geolocation",
+                    }
+                    st.session_state["guided_request_browser_location"] = False
+                else:
+                    st.warning("Browser returned invalid coordinates. Use manual place search.")
+                    st.session_state["guided_request_browser_location"] = False
+    destination_ids = _guided_destination_ids()
+    st.markdown("### Delivery destinations")
+    for index, destination_id in enumerate(destination_ids, start=1):
+        with st.container(border=True):
+            title_col, remove_col = st.columns([5, 1])
+            title_col.markdown(f"#### Destination {index}")
+            if index > 1:
+                remove_col.button(
+                    "Remove",
+                    key=f"guided_remove_destination_{destination_id}",
+                    on_click=_remove_guided_destination,
+                    args=(destination_id,),
+                )
+            _render_guided_destination_search(destination_id, index)
+            location = st.session_state.get(
+                f"guided_destination_location_{destination_id}"
+            )
+            if _is_guided_location(location):
+                name_key = f"guided_destination_name_{destination_id}"
+                if name_key not in st.session_state:
+                    st.session_state[name_key] = location["label"]
+                st.text_input("Destination name *", key=name_key)
+                demand_col, service_col = st.columns(2)
+                demand_key = f"guided_destination_demand_{destination_id}"
+                service_key = f"guided_destination_service_{destination_id}"
+                if demand_key not in st.session_state:
+                    st.session_state[demand_key] = 1.0
+                if service_key not in st.session_state:
+                    st.session_state[service_key] = 5
+                demand_col.number_input(
+                    "Demand",
+                    min_value=0.0,
+                    step=0.5,
+                    key=demand_key,
+                )
+                service_col.number_input(
+                    "Service (min)",
+                    min_value=0,
+                    step=1,
+                    key=service_key,
+                )
+                start_col, end_col = st.columns(2)
+                start_key = f"guided_destination_window_start_{destination_id}"
+                end_key = f"guided_destination_window_end_{destination_id}"
+                if start_key not in st.session_state:
+                    st.session_state[start_key] = time(8, 0)
+                if end_key not in st.session_state:
+                    st.session_state[end_key] = time(17, 0)
+                start_col.time_input("Window start", key=start_key)
+                end_col.time_input("Window end", key=end_key)
+                st.caption(
+                    f"Selected location: {location['label']} "
+                    f"({location['latitude']:.5f}, {location['longitude']:.5f})"
+                )
+            else:
+                st.info("Search for and select a place to enter delivery details.")
+    if len(destination_ids) < MAX_DASHBOARD_DELIVERIES:
+        st.button(
+            "+ Add Destination",
+            key="guided_add_destination",
+            on_click=_add_guided_destination,
+        )
+    else:
+        st.caption(f"A maximum of {MAX_DASHBOARD_DELIVERIES} destinations is supported.")
+
+    cargo_widget_key = "guided_cargo_demand_input"
+    if cargo_widget_key not in st.session_state:
+        st.session_state[cargo_widget_key] = st.session_state.get("guided_cargo_demand", 0.0)
+    st.number_input(
+        "Optional cargo demand (uploaded capacity units)",
+        min_value=0.0,
+        step=0.5,
+        key=cargo_widget_key,
+        on_change=_sync_guided_value,
+        args=(cargo_widget_key, "guided_cargo_demand"),
+        help="Used only for the existing selected-vehicle capacity check.",
+    )
+
+
+def _render_guided_destination_search(destination_id: int, ordinal: int) -> None:
+    query_key = f"guided_destination_query_{destination_id}"
+    result_key = f"guided_destination_search_results_{destination_id}"
+    error_key = f"guided_destination_search_error_{destination_id}"
+    selection_key = f"guided_destination_selection_{destination_id}"
+    location_key = f"guided_destination_location_{destination_id}"
+    with st.form(f"guided_destination_search_form_{destination_id}"):
+        query = st.text_input(
+            f"Search Destination {ordinal} by place, locality, or address",
+            key=query_key,
+            placeholder="Enter any supported place or address",
+        )
+        submitted = st.form_submit_button(f"Search Destination {ordinal}")
+    if submitted:
+        st.session_state.pop(location_key, None)
+        st.session_state.pop(selection_key, None)
+        if not query.strip():
+            st.session_state[result_key] = ()
+            st.session_state[error_key] = "Enter a place or address to search."
+        else:
+            places, error = search_places(query)
+            st.session_state[result_key] = places
+            st.session_state[error_key] = error
+    error = st.session_state.get(error_key)
+    if error:
+        st.warning(str(error))
+    places = st.session_state.get(result_key, ())
+    if not places:
+        return
+
+    selected_location = st.session_state.get(location_key)
+    selected_index = next(
+        (
+            index
+            for index, place in enumerate(places)
+            if isinstance(selected_location, dict)
+            and selected_location.get("latitude") == place.latitude
+            and selected_location.get("longitude") == place.longitude
+        ),
+        0,
+    )
+    selection = st.selectbox(
+        f"Matching Destination {ordinal} places",
+        range(len(places)),
+        index=selected_index,
+        format_func=lambda index: places[index].display_name,
+        key=selection_key,
+    )
+    chosen: PlaceResult = places[selection]
+    st.session_state[location_key] = {
+        "label": chosen.display_name,
+        "latitude": chosen.latitude,
+        "longitude": chosen.longitude,
+        "source": "OpenStreetMap Nominatim",
+    }
+
+
+def _guided_delivery_stops() -> tuple[DeliveryStop, ...]:
+    stops = []
+    for index, destination_id in enumerate(_guided_destination_ids(), start=1):
+        location = st.session_state.get(
+            f"guided_destination_location_{destination_id}"
+        )
+        if not _is_guided_location(location):
+            raise ValueError(f"select a valid location for Destination {index}")
+        destination = st.session_state.get(
+            f"guided_destination_name_{destination_id}",
+            location["label"],
+        )
+        if not isinstance(destination, str) or not destination.strip():
+            raise ValueError(f"Destination {index} name must not be empty")
+        stops.append(
+            DeliveryStop(
+                destination=destination.strip(),
+                latitude=float(location["latitude"]),
+                longitude=float(location["longitude"]),
+                demand=float(
+                    st.session_state.get(
+                        f"guided_destination_demand_{destination_id}",
+                        1.0,
+                    )
+                ),
+                window_start_min=_time_to_minutes(
+                    st.session_state.get(
+                        f"guided_destination_window_start_{destination_id}",
+                        time(8, 0),
+                    )
+                ),
+                window_end_min=_time_to_minutes(
+                    st.session_state.get(
+                        f"guided_destination_window_end_{destination_id}",
+                        time(17, 0),
+                    )
+                ),
+                service_duration_min=int(
+                    st.session_state.get(
+                        f"guided_destination_service_{destination_id}",
+                        5,
+                    )
+                ),
+            )
+        )
+    return tuple(stops)
+
+
+def _guided_map_preview() -> None:
+    origin = st.session_state.get("custom_origin")
+    if not _is_guided_location(origin):
+        st.warning("Select an origin in Delivery Details first.")
+        return
+    destinations = []
+    for destination_id in _guided_destination_ids():
+        location = st.session_state.get(
+            f"guided_destination_location_{destination_id}"
+        )
+        if not _is_guided_location(location):
+            continue
+        name = st.session_state.get(
+            f"guided_destination_name_{destination_id}",
+            location["label"],
+        )
+        destinations.append(
+            (
+                str(name),
+                (float(location["latitude"]), float(location["longitude"])),
+            )
+        )
+    if not destinations:
+        st.warning("Select at least one destination in Delivery Details first.")
+        return
+    route_map = build_location_preview_map(
+        (float(origin["latitude"]), float(origin["longitude"])),
+        tuple(destinations),
+        str(origin["label"]),
+    )
+    st_folium(
+        route_map,
+        height=480,
+        use_container_width=True,
+        returned_objects=[],
+        key="guided_location_preview_map",
+    )
+    st.caption(
+        f"The map shows the origin and all {len(destinations)} selected destination(s). "
+        "The route optimization step builds the existing travel matrix and validates "
+        "feasibility before solving."
+    )
+
+
+def _guided_scenario_form_values() -> dict[str, object]:
+    origin = st.session_state.get("custom_origin")
+    if not _is_guided_location(origin):
+        raise ValueError("select a valid origin")
+    stops = _guided_delivery_stops()
+    return {
+        "depot_name": str(origin["label"]),
+        "depot_latitude": float(origin["latitude"]),
+        "depot_longitude": float(origin["longitude"]),
+        "vehicle_count": int(st.session_state.get("guided_vehicle_count", 2)),
+        "capacity": float(st.session_state.get("guided_vehicle_capacity", 2.0)),
+        "shift_start": st.session_state.get("guided_shift_start", time(8, 0)),
+        "shift_end": st.session_state.get("guided_shift_end", time(17, 0)),
+        "traffic": "Moderate",
+        "fuel_type": "Diesel",
+        "fuel_price": float(
+            FUEL_OPTIONS["Diesel"]["default_price"] * INR_PER_COST_UNIT
+        ),
+        "driver_cost": 25.0 * INR_PER_COST_UNIT,
+        "objective": st.session_state.get(
+            "guided_objective",
+            next(iter(ObjectiveName)).value,
+        ),
+        "delivery_rows": [
+            {
+                "destination": stop.destination,
+                "latitude": stop.latitude,
+                "longitude": stop.longitude,
+                "demand": stop.demand,
+                "window_start": _format_time(stop.window_start_min),
+                "window_end": _format_time(stop.window_end_min),
+                "service_minutes": stop.service_duration_min,
+            }
+            for stop in stops
+        ],
+    }
+
+
+def _guided_optimization_signature(
+    values: dict[str, object],
+    qaoa_config: QAOAConfig,
+    use_osrm: bool,
+) -> str:
+    return sha256(
+        repr((values, qaoa_config, use_osrm)).encode("utf-8")
+    ).hexdigest()
+
+
+def _guided_route_optimization(
+    qaoa_config: QAOAConfig,
+    use_osrm: bool,
+) -> None:
+    objective_options = tuple(item.value for item in ObjectiveName)
+    objective_key = "guided_objective"
+    if objective_key not in st.session_state:
+        st.session_state[objective_key] = objective_options[0]
+    if st.session_state[objective_key] not in objective_options:
+        st.session_state[objective_key] = objective_options[0]
+    st.selectbox(
+        "Optimization objective",
+        objective_options,
+        key=objective_key,
+    )
+    st.caption(
+        "All selected destinations are passed to the existing scenario, feasibility, "
+        "classical optimization, QUBO, and QAOA workflow."
+    )
+    try:
+        values = _guided_scenario_form_values()
+        signature = _guided_optimization_signature(values, qaoa_config, use_osrm)
+    except (ValueError, TypeError, KeyError) as error:
+        st.warning(f"Complete valid Delivery and Fleet details before optimizing: {error}")
+        return
+
+    if st.button(
+        "Optimize all destinations",
+        type="primary",
+        use_container_width=True,
+        key="guided_optimize_destinations",
+    ):
+        st.session_state.pop("guided_optimization_signature", None)
+        _run_from_form(values, qaoa_config, use_osrm)
+        run_error = st.session_state.get("run_error")
+        if run_error:
+            st.session_state["guided_optimization_error"] = run_error
+            st.session_state.pop("guided_run", None)
+        else:
+            st.session_state.pop("guided_optimization_error", None)
+            st.session_state["guided_run"] = st.session_state["current_run"]
+            st.session_state["guided_optimization_signature"] = signature
+
+    run_error = st.session_state.get("guided_optimization_error")
+    if run_error:
+        st.error(run_error)
+    elif st.session_state.get("guided_optimization_signature") == signature:
+        st.success(
+            f"Optimization complete for {len(values['delivery_rows'])} destination(s). "
+            "Continue to Final Results to review vehicle assignments."
+        )
+    else:
+        st.info("Run optimization to generate validated assignments for every destination.")
+
+
+def _guided_final_results(
+    qaoa_config: QAOAConfig,
+    use_osrm: bool,
+) -> None:
+    try:
+        values = _guided_scenario_form_values()
+        signature = _guided_optimization_signature(values, qaoa_config, use_osrm)
+    except (ValueError, TypeError, KeyError) as error:
+        st.info(f"Select valid locations and delivery details before viewing results: {error}")
+        return
+
+    run_record = st.session_state.get("guided_run")
+    if (
+        not isinstance(run_record, dict)
+        or st.session_state.get("guided_optimization_signature") != signature
+    ):
+        st.info(
+            "No current optimization result matches these inputs. Return to Optimize Routes "
+            "and run the pipeline again."
+        )
+        return
+
+    scenario = run_record["scenario"]
+    run = run_record["run"]
+    assignments = []
+    summaries = [("Classical exact", run.classical)]
+    if run.quantum is not None:
+        summaries.append(("QAOA / Aer", run.quantum))
+    delivery_by_id = {delivery.delivery_id: delivery for delivery in scenario.deliveries}
+    for solver, summary in summaries:
+        for route in summary.routes:
+            for delivery_id in route.plan.delivery_ids:
+                delivery = delivery_by_id[delivery_id]
+                assignments.append(
+                    {
+                        "Solver": solver,
+                        "Vehicle": route.plan.vehicle_id,
+                        "Destination": scenario.location_names[delivery.location],
+                        "Demand": delivery.demand,
+                        "Window": (
+                            f"{_format_time(delivery.window_start_min)}–"
+                            f"{_format_time(delivery.window_end_min)}"
+                        ),
+                    }
+                )
+    st.markdown(f"### Assignments for all {len(scenario.deliveries)} destinations")
+    st.dataframe(pd.DataFrame(assignments), hide_index=True, width="stretch")
+    _render_results(scenario, run)
+    _render_route_map(
+        scenario,
+        run,
+        None,
+        key_prefix="guided_final_results",
+    )
+
+    vehicle = st.session_state.get("guided_selected_vehicle")
+    cargo = st.session_state.get("guided_cargo_demand", 0)
+    if isinstance(vehicle, dict) and cargo:
+        if cargo <= vehicle["capacity"]:
+            st.success("The optional cargo demand is within the selected vehicle's stated capacity.")
+        else:
+            st.error("The optional cargo demand exceeds the selected vehicle's stated capacity.")
+    _render_historical_ibm_evidence()
+
+
+def _reset_guided_route() -> None:
+    destination_keys = (
+        "location",
+        "search_results",
+        "search_error",
+        "query",
+        "selection",
+        "name",
+        "demand",
+        "window_start",
+        "window_end",
+        "service",
+    )
+    for destination_id in _guided_destination_ids():
+        for suffix in destination_keys:
+            st.session_state.pop(
+                f"guided_destination_{suffix}_{destination_id}",
+                None,
+            )
+    for key in (
+        "guided_step",
+        "guided_validation_error",
+        "guided_destination_ids",
+        "guided_destination_next_id",
+        "guided_optimization_signature",
+        "guided_optimization_error",
+        "guided_run",
+        "custom_origin",
+        "custom_destination",
+        "custom_route_result",
+        "guided_scored_routes",
+        "guided_route_request_key",
+        "guided_request_browser_location",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state["guided_destination_ids"] = [0]
+    st.session_state["guided_destination_next_id"] = 1
+    st.session_state["guided_step"] = 0
+
+
 def _render_custom_route_planner() -> None:
     st.markdown("## Custom Route Planner / Route Explorer")
     st.caption(
@@ -3973,9 +4870,21 @@ def _render_custom_place_search(field: str) -> None:
         st.warning(error)
     places = st.session_state.get(f"custom_{field}_search_results", ())
     if places:
+        selected_place = st.session_state.get(f"custom_{field}")
+        selected_index = next(
+            (
+                index
+                for index, place in enumerate(places)
+                if isinstance(selected_place, dict)
+                and selected_place.get("latitude") == place.latitude
+                and selected_place.get("longitude") == place.longitude
+            ),
+            0,
+        )
         selection = st.selectbox(
             f"Matching {field} places",
             range(len(places)),
+            index=selected_index,
             format_func=lambda index: places[index].display_name,
             key=f"custom_{field}_place_selection",
         )
@@ -3990,7 +4899,10 @@ def _render_custom_place_search(field: str) -> None:
         st.info(f"No matching {title.lower()} was returned. Try a more specific search.")
 
 
-def _render_custom_fleet_profile() -> dict[str, object] | None:
+def _render_custom_fleet_profile(
+    *,
+    key_prefix: str = "",
+) -> dict[str, object] | None:
     with st.expander("Fleet Data / Company Profile (optional)", expanded=False):
         st.caption(
             "Required: vehicle_id and capacity. Optional: company_id, vehicle_type, "
@@ -4120,10 +5032,20 @@ def _render_custom_fleet_profile() -> dict[str, object] | None:
             )
             profiles.setdefault(profile_id, []).append(row)
         profile_ids = tuple(profiles)
+        profile_key = (
+            f"{key_prefix}_custom_fleet_profile_"
+            if key_prefix
+            else "custom_fleet_profile_"
+        ) + f"{st.session_state.get('custom_fleet_accepted_fingerprint', '')[:12]}"
+        saved_profile = st.session_state.get("guided_fleet_profile_id")
+        if profile_key not in st.session_state and saved_profile in profile_ids:
+            st.session_state[profile_key] = saved_profile
+        if profile_key in st.session_state and st.session_state[profile_key] not in profile_ids:
+            st.session_state.pop(profile_key, None)
         selected_profile = st.selectbox(
             "Company / fleet profile",
             profile_ids,
-            key=f"custom_fleet_profile_{st.session_state.get('custom_fleet_accepted_fingerprint', '')[:12]}",
+            key=profile_key,
         )
         profile_rows = profiles[selected_profile]
         selectable_rows = [row for row in profile_rows if row.get("available") is not False]
@@ -4137,18 +5059,31 @@ def _render_custom_fleet_profile() -> dict[str, object] | None:
             return None
         rows_by_id = {str(row["vehicle_id"]): row for row in selectable_rows}
         vehicle_ids = tuple(rows_by_id)
+        vehicle_key = (
+            f"{key_prefix}_custom_fleet_vehicle_"
+            if key_prefix
+            else "custom_fleet_vehicle_"
+        ) + (
+            f"{st.session_state.get('custom_fleet_accepted_fingerprint', '')[:12]}_"
+            f"{sha256(selected_profile.encode('utf-8')).hexdigest()[:8]}"
+        )
+        saved_vehicle = st.session_state.get("guided_selected_vehicle_id")
+        if vehicle_key not in st.session_state and saved_vehicle in vehicle_ids:
+            st.session_state[vehicle_key] = saved_vehicle
+        if vehicle_key in st.session_state and st.session_state[vehicle_key] not in vehicle_ids:
+            st.session_state.pop(vehicle_key, None)
         selected_id = st.selectbox(
             "Vehicle for estimates and supported checks",
             vehicle_ids,
             format_func=lambda vehicle_id: _custom_fleet_vehicle_label(
                 rows_by_id[vehicle_id]
             ),
-            key=(
-                f"custom_fleet_vehicle_{st.session_state.get('custom_fleet_accepted_fingerprint', '')[:12]}_"
-                f"{sha256(selected_profile.encode('utf-8')).hexdigest()[:8]}"
-            ),
+            key=vehicle_key,
         )
         selected_vehicle = rows_by_id[selected_id]
+        if key_prefix:
+            st.session_state["guided_fleet_profile_id"] = selected_profile
+            st.session_state["guided_selected_vehicle_id"] = selected_id
         _render_custom_fuel_profile_details(selected_vehicle)
         availability = selected_vehicle.get("available")
         if availability is None:

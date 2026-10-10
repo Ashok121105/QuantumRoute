@@ -43,6 +43,50 @@ class ScoredRoadAlternative:
     objective_score: float
 
 
+def build_location_preview_map(
+    origin: tuple[float, float],
+    destinations: tuple[tuple[str, tuple[float, float]], ...],
+    origin_label: str,
+) -> folium.Map:
+    """Show selected locations before route optimization has been run."""
+    route_map = folium.Map(
+        location=origin,
+        zoom_start=12,
+        tiles="OpenStreetMap",
+        control_scale=True,
+    )
+    folium.CircleMarker(
+        origin,
+        radius=10,
+        color="#22D3EE",
+        weight=2,
+        fill=True,
+        fill_color="#101D30",
+        fill_opacity=1.0,
+        tooltip=f"Origin | {escape(origin_label)}",
+    ).add_to(route_map)
+
+    bounds = [origin]
+    for index, (label, coordinate) in enumerate(destinations, start=1):
+        escaped_label = escape(label)
+        folium.CircleMarker(
+            coordinate,
+            radius=7,
+            color="#A78BFA",
+            weight=2,
+            fill=True,
+            fill_color="#A78BFA",
+            fill_opacity=0.95,
+            tooltip=f"Destination {index} | {escaped_label}",
+            popup=escaped_label,
+        ).add_to(route_map)
+        bounds.append(coordinate)
+
+    if len(bounds) > 1:
+        route_map.fit_bounds(bounds, padding=(20, 20))
+    return route_map
+
+
 def rank_road_alternatives(
     scenario: ScenarioProblem,
     objective_name: str,

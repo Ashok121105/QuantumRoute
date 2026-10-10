@@ -40,6 +40,7 @@ class FleetDisruptionUITests(unittest.TestCase):
         )
 
         app = AppTest.from_file("app.py", default_timeout=300).run()
+        app.session_state["active_page"] = "Dashboard"
         app.session_state["fleet_disruption_result"] = disruption
         with (
             patch.object(ui, "_render_waitlist"),

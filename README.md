@@ -24,6 +24,14 @@ See the [official six-slide Qiskit Fall Fest submission](docs/QuantumRoute_Qiski
 [slide source](docs/hackathon-presentation.md). No IBM hardware job is needed
 for this walkthrough.
 
+The **A–F Guided Workflow** in the sidebar supports an origin and up to five
+delivery destinations, each with its own demand, delivery window, and service
+time. It previews all selected locations, then sends the full scenario through
+the existing feasibility, classical, QUBO, and QAOA pipeline and displays
+vehicle assignments for every destination. Inputs remain available when moving
+Back and Next. This multi-delivery flow is separate from the point-to-point
+Custom Route Planner.
+
 The separate **Custom Route Planner** supports explicit browser location
 permission or OpenStreetMap place search, OSRM point-to-point road alternatives,
 and session-only CSV/XLSX fleet profiles. See the

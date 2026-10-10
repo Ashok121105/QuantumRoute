@@ -726,29 +726,14 @@ class ThemeWorkspaceSmokeTests(unittest.TestCase):
             "Benchmark Mode": "Benchmark laboratory",
             "History": "Operation history",
         }
-        with (
-            patch.object(
-                ui,
-                "discover_ibm_backends",
-                side_effect=AssertionError("Backend discovery must remain explicit."),
-            ) as discover,
-            patch.object(
-                ui,
-                "connect_ibm_quantum",
-                side_effect=AssertionError("The IBM account must not be contacted."),
-            ) as connect,
-            patch.object(
-                ui,
-                "dry_run_optimized_qaoa_execution",
-                side_effect=AssertionError("No IBM hardware preflight is requested."),
-            ) as preflight,
-            patch.object(
-                ui,
-                "submit_confirmed_hardware_job",
-                side_effect=AssertionError("No IBM hardware job may be submitted."),
-            ) as submit,
-        ):
+        with patch.object(
+            ui,
+            "discover_ibm_backends",
+            side_effect=AssertionError("Backend discovery must remain explicit."),
+        ) as discover:
             app = AppTest.from_file("app.py", default_timeout=30).run()
+            app.session_state["active_page"] = "Dashboard"
+            app.run()
             for page, expected_title in pages.items():
                 if page != "Dashboard":
                     app.session_state["active_page"] = page
@@ -763,6 +748,6 @@ class ThemeWorkspaceSmokeTests(unittest.TestCase):
                 )
 
         discover.assert_not_called()
-        connect.assert_not_called()
-        preflight.assert_not_called()
-        submit.assert_not_called()
+        self.assertFalse(hasattr(ui, "connect_ibm_quantum"))
+        self.assertFalse(hasattr(ui, "dry_run_optimized_qaoa_execution"))
+        self.assertFalse(hasattr(ui, "submit_confirmed_hardware_job"))
